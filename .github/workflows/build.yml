@@ -1,0 +1,48 @@
+name: Build MSGChatFolders
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build dylib
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build MSGChatFolders.dylib
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK: $SDK_PATH"
+          mkdir -p build
+          clang \
+            -fobjc-arc \
+            -fmodules \
+            -target arm64-apple-ios15.0 \
+            -isysroot "$SDK_PATH" \
+            -Wall -Wno-unused-variable -Wno-unused-function \
+            -O2 \
+            -dynamiclib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -Wl,-undefined,dynamic_lookup \
+            -install_name @executable_path/Frameworks/MSGChatFolders.dylib \
+            -o build/MSGChatFolders.dylib \
+            MSGChatFolders_main.m \
+            MSGChatFolderManager.m \
+            MSGChatFolderTabView.m \
+            MSGChatFolderHooks.m
+          file build/MSGChatFolders.dylib
+          ls -la build/MSGChatFolders.dylib
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSGChatFolders-dylib
+          path: build/MSGChatFolders.dylib
+          retention-days: 90
