@@ -146,7 +146,16 @@ static const NSInteger kTagBase       = 7000;
     btn.layer.cornerRadius = kTabCornerRadius;
     btn.clipsToBounds = YES;
     btn.tag = kTagBase + tag;
-    btn.contentEdgeInsets = UIEdgeInsetsMake(0, kTabHPadding, 0, kTabHPadding);
+    if (@available(iOS 15.0, *)) {
+        UIButtonConfiguration *config = [UIButtonConfiguration plainButtonConfiguration];
+        config.contentInsets = NSDirectionalEdgeInsetsMake(0, kTabHPadding, 0, kTabHPadding);
+        btn.configuration = config;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        btn.contentEdgeInsets = UIEdgeInsetsMake(0, kTabHPadding, 0, kTabHPadding);
+#pragma clang diagnostic pop
+    }
     [btn addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     // Long press for rename/delete
