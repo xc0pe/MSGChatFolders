@@ -29,6 +29,14 @@ static const void *kFolderTabViewKey    = &kFolderTabViewKey;
 static const void *kFolderInitializedKey = &kFolderInitializedKey;
 
 // ═══════════════════════════════════════════════════════════
+// MARK: - Forward Declarations
+// ═══════════════════════════════════════════════════════════
+
+static void msgcf_folderTabDidSelect(id self, SEL _cmd, NSNotification *note);
+static void msgcf_folderTabDidCreate(id self, SEL _cmd, NSNotification *note);
+static void msgcf_folderTabDidLongPress(id self, SEL _cmd, NSNotification *note);
+
+// ═══════════════════════════════════════════════════════════
 // MARK: - Original Method Pointers (IMPs)
 // ═══════════════════════════════════════════════════════════
 
