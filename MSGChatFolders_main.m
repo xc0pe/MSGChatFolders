@@ -16,6 +16,62 @@
 extern void MSGChatFolders_RegisterHooks(void);
 
 // ═══════════════════════════════════════════════════════════
+// MARK: - Forward Declarations
+// ═══════════════════════════════════════════════════════════
+
+static UIViewController *MSGChatFolders_topViewController(void);
+static void MSGChatFolders_reloadCollectionViews(UIView *view);
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Utilities
+// ═══════════════════════════════════════════════════════════
+
+/// Finds the key window using the modern API.
+static UIWindow *MSGChatFolders_keyWindow(void) {
+    UIWindow *window = nil;
+    if (@available(iOS 15.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow) {
+                        window = w;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (!window) {
+        window = [UIApplication sharedApplication].keyWindow;
+    }
+#pragma clang diagnostic pop
+    return window;
+}
+
+/// Finds the topmost presented view controller.
+static UIViewController *MSGChatFolders_topViewController(void) {
+    UIWindow *window = MSGChatFolders_keyWindow();
+    UIViewController *vc = window.rootViewController;
+    while (vc.presentedViewController) {
+        vc = vc.presentedViewController;
+    }
+    return vc;
+}
+
+/// Recursively finds and reloads all collection views in the hierarchy.
+static void MSGChatFolders_reloadCollectionViews(UIView *view) {
+    if ([view isKindOfClass:[UICollectionView class]]) {
+        [(UICollectionView *)view reloadData];
+    }
+    for (UIView *sub in view.subviews) {
+        MSGChatFolders_reloadCollectionViews(sub);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // MARK: - Notification-Based Tab View Delegate Bridge
 // ═══════════════════════════════════════════════════════════
 
@@ -34,9 +90,9 @@ static void patchTabViewActions(void) {
         typedef void (*TabTappedIMP)(id, SEL, id);
         TabTappedIMP origTabTapped = (TabTappedIMP)method_getImplementation(tabTappedMethod);
 
-        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *self, UIButton *sender) {
+        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *blockSelf, UIButton *sender) {
             // Call original
-            origTabTapped(self, tabTappedSel, sender);
+            origTabTapped(blockSelf, tabTappedSel, sender);
 
             // Post notification with folder ID
             NSString *folderId = [MSGChatFolderManager sharedManager].selectedFolderId;
@@ -51,20 +107,17 @@ static void patchTabViewActions(void) {
 
     // Override addButtonTapped to post a notification
     SEL addSel = NSSelectorFromString(@"addButtonTapped");
-    Method addMethod = class_getInstanceMethod(tabViewClass, addSel);
+    Method addBtnMethod = class_getInstanceMethod(tabViewClass, addSel);
 
-    if (addMethod) {
-        typedef void (*AddIMP)(id, SEL);
-        __unused AddIMP origAdd = (AddIMP)method_getImplementation(addMethod);
-
-        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *self) {
+    if (addBtnMethod) {
+        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *blockSelf) {
             [[NSNotificationCenter defaultCenter]
                 postNotificationName:@"MSGChatFolders_CreateFolder"
                               object:nil
                             userInfo:nil];
         });
 
-        method_setImplementation(addMethod, newIMP);
+        method_setImplementation(addBtnMethod, newIMP);
     }
 
     // Override tabLongPressed: to post a notification
@@ -72,10 +125,7 @@ static void patchTabViewActions(void) {
     Method longPressMethod = class_getInstanceMethod(tabViewClass, longPressSel);
 
     if (longPressMethod) {
-        typedef void (*LongPressIMP)(id, SEL, id);
-        LongPressIMP origLongPress = (LongPressIMP)method_getImplementation(longPressMethod);
-
-        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *self, UILongPressGestureRecognizer *gesture) {
+        IMP newIMP = imp_implementationWithBlock(^(MSGChatFolderTabView *blockSelf, UILongPressGestureRecognizer *gesture) {
             if (gesture.state != UIGestureRecognizerStateBegan) return;
 
             UIButton *btn = (UIButton *)gesture.view;
@@ -101,12 +151,7 @@ static void patchTabViewActions(void) {
 // MARK: - Setup Notification Observers on Inbox VC
 // ═══════════════════════════════════════════════════════════
 
-/// This patches the inbox VC's viewDidAppear to also register for our notifications.
 static void setupInboxNotificationObservers(void) {
-    // We'll set up observers when the inbox VC appears.
-    // This is handled inside hooked_inboxViewDidAppear in Hooks.m
-    // by checking for existing observers.
-
     // Register for folder selection changes globally
     [[NSNotificationCenter defaultCenter]
         addObserverForName:@"MSGChatFolders_FolderSelected"
@@ -116,28 +161,10 @@ static void setupInboxNotificationObservers(void) {
         NSString *folderId = note.userInfo[@"folderId"];
         NSLog(@"[MSGChatFolders] Folder selected: %@", folderId);
 
-        // Find the topmost presented view controller and reload its collection view
-        UIWindow *window = nil;
-        if (@available(iOS 15.0, *)) {
-            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if ([scene isKindOfClass:[UIWindowScene class]]) {
-                    UIWindowScene *windowScene = (UIWindowScene *)scene;
-                    for (UIWindow *w in windowScene.windows) {
-                        if (w.isKeyWindow) {
-                            window = w;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if (!window) {
-            window = [UIApplication sharedApplication].keyWindow;
-        }
-
+        UIWindow *window = MSGChatFolders_keyWindow();
         if (window) {
             UIViewController *rootVC = window.rootViewController;
-            [MSGChatFolders_reloadCollectionViews:rootVC.view];
+            MSGChatFolders_reloadCollectionViews(rootVC.view);
         }
     }];
 
@@ -224,9 +251,10 @@ static void setupInboxNotificationObservers(void) {
                 [topVC presentViewController:renameAlert animated:YES completion:nil];
             }]];
 
-            [alert addAction:[UIAlertAction actionWithTitle:@"🗑 Delete Folder"
-                                                      style:UIAlertActionStyleDestructive
-                                                    handler:^(UIAlertAction *a) {
+            [alert addAction:[UIAlertAction
+                actionWithTitle:@"🗑 Delete Folder"
+                          style:UIAlertActionStyleDestructive
+                        handler:^(UIAlertAction *a) {
                 UIAlertController *confirm = [UIAlertController
                     alertControllerWithTitle:@"Delete Folder?"
                                      message:[NSString stringWithFormat:
@@ -259,44 +287,6 @@ static void setupInboxNotificationObservers(void) {
     }];
 
     NSLog(@"[MSGChatFolders] Notification observers registered.");
-}
-
-// ═══════════════════════════════════════════════════════════
-// MARK: - Utilities
-// ═══════════════════════════════════════════════════════════
-
-/// Finds the topmost presented view controller.
-static UIViewController *MSGChatFolders_topViewController(void) {
-    UIWindow *window = nil;
-    if (@available(iOS 15.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                UIWindowScene *ws = (UIWindowScene *)scene;
-                for (UIWindow *w in ws.windows) {
-                    if (w.isKeyWindow) { window = w; break; }
-                }
-            }
-        }
-    }
-    if (!window) {
-        window = [UIApplication sharedApplication].keyWindow;
-    }
-
-    UIViewController *vc = window.rootViewController;
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
-    }
-    return vc;
-}
-
-/// Recursively finds and reloads all collection views in the hierarchy.
-static void MSGChatFolders_reloadCollectionViews(UIView *view) {
-    if ([view isKindOfClass:[UICollectionView class]]) {
-        [(UICollectionView *)view reloadData];
-    }
-    for (UIView *sub in view.subviews) {
-        MSGChatFolders_reloadCollectionViews(sub);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════
