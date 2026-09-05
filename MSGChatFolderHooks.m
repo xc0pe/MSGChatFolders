@@ -617,7 +617,7 @@ static void hookContextMenuOnDelegate(UICollectionView *cv) {
         CFLOG(@"  Will search for UIContextMenuInteraction on the collection view instead...");
 
         // Fallback: Check if the collection view has a UIContextMenuInteraction
-        for (UIInteraction *interaction in cv.interactions) {
+        for (id<UIInteraction> interaction in cv.interactions) {
             if ([interaction isKindOfClass:[UIContextMenuInteraction class]]) {
                 UIContextMenuInteraction *ctxInteraction = (UIContextMenuInteraction *)interaction;
                 id ctxDelegate = ctxInteraction.delegate;
