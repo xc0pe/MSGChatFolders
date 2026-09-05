@@ -48,9 +48,11 @@ static UIViewController *findTopViewController(void);
 // MSGInboxViewController viewDidAppear:
 static void (*orig_inboxViewDidAppear)(id self, SEL _cmd, BOOL animated);
 
-// Dynamic context menu hook (set at runtime when we discover the delegate class)
+// Dynamic hooks (set at runtime when we discover the delegate class)
 static UIContextMenuConfiguration *(*orig_contextMenuForItemAtIndex)(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip, CGPoint point);
 static UIContextMenuConfiguration *(*orig_contextMenuForItemsAtIndices)(id self, SEL _cmd, UICollectionView *cv, NSArray *indexPaths, CGPoint point);
+static void (*orig_didSelectItemAtIndex)(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip);
+static const void *kDidSelectHookedKey = &kDidSelectHookedKey;
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Top View Controller Utility
@@ -560,12 +562,57 @@ static UIContextMenuConfiguration *hooked_contextMenuForItemsAtIndices(
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - Dynamic Context Menu Hook Registration
+// MARK: - Hooked didSelectItemAtIndexPath (Assign Mode)
 // ═══════════════════════════════════════════════════════════
 
-/// Dynamically hooks the context menu method on whatever class is serving
+/// When assign mode is ON, tapping a conversation shows the folder sheet
+/// instead of opening the chat. When OFF, normal Messenger behavior.
+static void hooked_didSelectItemAtIndex(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
+    if (MSGChatFolders_assignModeActive) {
+        CFLOG(@"Assign mode: intercepted tap at indexPath %@", indexPath);
+
+        UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
+        NSString *threadKey = extractThreadKeyFromCell(cell);
+
+        if (threadKey) {
+            UIViewController *topVC = findTopViewController();
+            if (topVC) {
+                presentFolderActionSheet(topVC, threadKey);
+            }
+        } else {
+            CFLOG(@"Assign mode: could not extract threadKey at %@", indexPath);
+            // Still show an alert so user knows it was intercepted
+            UIViewController *topVC = findTopViewController();
+            if (topVC) {
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:@"Could not identify conversation"
+                                     message:@"Thread key extraction failed. Check logs for details."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:nil]];
+                [topVC presentViewController:alert animated:YES completion:nil];
+            }
+        }
+
+        // Deselect the cell (don't navigate)
+        [cv deselectItemAtIndexPath:indexPath animated:YES];
+        return;  // Don't call original — prevent opening the chat
+    }
+
+    // Assign mode OFF — call original Messenger behavior
+    if (orig_didSelectItemAtIndex) {
+        orig_didSelectItemAtIndex(self, _cmd, cv, indexPath);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Dynamic Delegate Hook Registration
+// ═══════════════════════════════════════════════════════════
+
+/// Dynamically hooks the delegate methods on whatever class is serving
 /// as the collection view's delegate. Called once after we find the collection view.
-static void hookContextMenuOnDelegate(UICollectionView *cv) {
+static void hookDelegateOnCollectionView(UICollectionView *cv) {
     id delegate = cv.delegate;
     if (!delegate) {
         CFLOG(@"Context menu hook: collection view has no delegate");
@@ -633,6 +680,28 @@ static void hookContextMenuOnDelegate(UICollectionView *cv) {
                     }
                 }
             }
+        }
+    }
+
+    // ── Hook didSelectItemAtIndexPath (for assign mode) ──
+    // This is the PRIMARY hook for folder assignment.
+    // When assign mode is ON, tapping a conversation shows the folder sheet
+    // instead of opening the chat.
+    NSNumber *selectHooked = objc_getAssociatedObject(delegateClass, kDidSelectHookedKey);
+    if (![selectHooked boolValue]) {
+        SEL didSelectSel = @selector(collectionView:didSelectItemAtIndexPath:);
+        if ([delegate respondsToSelector:didSelectSel]) {
+            Method method = class_getInstanceMethod(delegateClass, didSelectSel);
+            if (method) {
+                orig_didSelectItemAtIndex = (void (*)(id, SEL, UICollectionView *, NSIndexPath *))
+                    method_getImplementation(method);
+                method_setImplementation(method, (IMP)hooked_didSelectItemAtIndex);
+                objc_setAssociatedObject(delegateClass, kDidSelectHookedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                CFLOG(@"✅ Hooked collectionView:didSelectItemAtIndexPath: on %@", delegateClassName);
+                CFLOG(@"   📂 Tap the 📂 button in the folder tab bar to enter assign mode");
+            }
+        } else {
+            CFLOG(@"⚠️ Delegate %@ does not implement didSelectItemAtIndexPath!", delegateClassName);
         }
     }
 }
@@ -808,7 +877,7 @@ static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
               NSStringFromClass([mainCV.delegate class]));
 
         // ── Hook the context menu on this collection view's delegate ──
-        hookContextMenuOnDelegate(mainCV);
+        hookDelegateOnCollectionView(mainCV);
 
     } else {
         // Fallback: add at the top
