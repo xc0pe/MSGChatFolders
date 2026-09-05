@@ -3,8 +3,8 @@
 //  MSGChatFolders — Messenger Chat Folders Tweak
 //
 //  Runtime method swizzling hooks for Messenger.
-//  Injects the folder tab bar into the inbox, adds context menu actions,
-//  and filters the conversation list based on the selected folder.
+//  Injects the folder tab bar into the inbox and adds "Add to Folder"
+//  directly into Messenger's native long-press context menu.
 //
 //  Uses objc/runtime.h directly (no Theos/Logos dependency).
 //
@@ -25,8 +25,10 @@
 // MARK: - Associated Object Keys
 // ═══════════════════════════════════════════════════════════
 
-static const void *kFolderTabViewKey    = &kFolderTabViewKey;
-static const void *kFolderInitializedKey = &kFolderInitializedKey;
+static const void *kFolderTabViewKey         = &kFolderTabViewKey;
+static const void *kFolderInitializedKey     = &kFolderInitializedKey;
+static const void *kContextMenuHookedKey     = &kContextMenuHookedKey;
+static const void *kCollectionViewRefKey     = &kCollectionViewRefKey;
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Forward Declarations
@@ -35,16 +37,46 @@ static const void *kFolderInitializedKey = &kFolderInitializedKey;
 static void msgcf_folderTabDidSelect(id self, SEL _cmd, NSNotification *note);
 static void msgcf_folderTabDidCreate(id self, SEL _cmd, NSNotification *note);
 static void msgcf_folderTabDidLongPress(id self, SEL _cmd, NSNotification *note);
+static NSString *extractThreadKeyFromCell(UIView *cell);
+static void presentFolderActionSheet(UIViewController *presenter, NSString *threadKey);
+static UIViewController *findTopViewController(void);
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Original Method Pointers (IMPs)
 // ═══════════════════════════════════════════════════════════
 
-// MSGInboxViewController
+// MSGInboxViewController viewDidAppear:
 static void (*orig_inboxViewDidAppear)(id self, SEL _cmd, BOOL animated);
 
-// UICollectionView context menu
-static id (*orig_contextMenuConfig)(id self, SEL _cmd, id collectionView, id indexPath, id point);
+// Dynamic context menu hook (set at runtime when we discover the delegate class)
+static UIContextMenuConfiguration *(*orig_contextMenuForItemAtIndex)(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip, CGPoint point);
+static UIContextMenuConfiguration *(*orig_contextMenuForItemsAtIndices)(id self, SEL _cmd, UICollectionView *cv, NSArray *indexPaths, CGPoint point);
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Top View Controller Utility
+// ═══════════════════════════════════════════════════════════
+
+static UIViewController *findTopViewController(void) {
+    UIWindow *window = nil;
+    if (@available(iOS 15.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow) { window = w; break; }
+                }
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (!window) window = [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
+
+    UIViewController *vc = window.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Thread Key Extraction
@@ -66,14 +98,13 @@ static NSString *extractThreadKeyFromCell(UIView *cell) {
         @try {
             id value = [cell valueForKey:key];
             if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+                CFLOG(@"Found threadKey via KVC '%@': %@", key, value);
                 return value;
             }
             if ([value isKindOfClass:[NSNumber class]]) {
                 return [value stringValue];
             }
-        } @catch (NSException *e) {
-            // Key doesn't exist, continue
-        }
+        } @catch (NSException *e) {}
     }
 
     // Strategy 2: Look for a "model", "viewModel", "data" property on the cell
@@ -85,32 +116,29 @@ static NSString *extractThreadKeyFromCell(UIView *cell) {
             id model = [cell valueForKey:modelKey];
             if (!model) continue;
 
-            // Try extracting thread key from the model
             for (NSString *key in keyNames) {
                 @try {
                     id value = [model valueForKey:key];
                     if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+                        CFLOG(@"Found threadKey via model '%@.%@': %@", modelKey, key, value);
                         return value;
                     }
                     if ([value isKindOfClass:[NSNumber class]]) {
                         return [value stringValue];
                     }
-                } @catch (NSException *e) {
-                    // Key doesn't exist on model, continue
-                }
+                } @catch (NSException *e) {}
             }
-        } @catch (NSException *e) {
-            // Model key doesn't exist, continue
-        }
+        } @catch (NSException *e) {}
     }
 
-    // Strategy 3: Traverse the responder chain looking for a thread key
+    // Strategy 3: Traverse the responder chain
     UIResponder *responder = cell;
     for (int depth = 0; depth < 10 && responder; depth++) {
         for (NSString *key in keyNames) {
             @try {
                 id value = [(id)responder valueForKey:key];
                 if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+                    CFLOG(@"Found threadKey via responder chain (depth %d): %@", depth, value);
                     return value;
                 }
             } @catch (NSException *e) {}
@@ -118,7 +146,7 @@ static NSString *extractThreadKeyFromCell(UIView *cell) {
         responder = [responder nextResponder];
     }
 
-    // Strategy 4: Use the cell's accessibilityIdentifier (Messenger sometimes sets this)
+    // Strategy 4: Use accessibilityIdentifier
     if ([cell isKindOfClass:[UIView class]]) {
         NSString *accId = [(UIView *)cell accessibilityIdentifier];
         if (accId && accId.length > 5) {
@@ -127,17 +155,16 @@ static NSString *extractThreadKeyFromCell(UIView *cell) {
         }
     }
 
-    // Strategy 5: Scan all ivars of the cell class for string values containing "t_"
+    // Strategy 5: Scan all ivars for string values containing "t_" (Messenger thread key prefix)
     unsigned int ivarCount = 0;
     Ivar *ivars = class_copyIvarList([cell class], &ivarCount);
     for (unsigned int i = 0; i < ivarCount; i++) {
         const char *ivarType = ivar_getTypeEncoding(ivars[i]);
-        if (ivarType && ivarType[0] == '@') {  // Object type
+        if (ivarType && ivarType[0] == '@') {
             @try {
                 id val = object_getIvar(cell, ivars[i]);
                 if ([val isKindOfClass:[NSString class]]) {
                     NSString *str = (NSString *)val;
-                    // Messenger thread keys often start with "t_" or are numeric
                     if ([str hasPrefix:@"t_"] || (str.length > 10 && [str longLongValue] > 0)) {
                         const char *name = ivar_getName(ivars[i]);
                         CFLOG(@"Found potential threadKey in ivar '%s': %@", name, str);
@@ -150,12 +177,56 @@ static NSString *extractThreadKeyFromCell(UIView *cell) {
     }
     if (ivars) free(ivars);
 
+    // Strategy 6: Scan ivars of model objects attached to the cell
+    NSArray *modelIvarNames = @[@"_model", @"_viewModel", @"_data", @"_item", @"_thread"];
+    Ivar *cellIvars = class_copyIvarList([cell class], &ivarCount);
+    for (unsigned int i = 0; i < ivarCount; i++) {
+        NSString *ivarName = [NSString stringWithUTF8String:ivar_getName(cellIvars[i])];
+        for (NSString *modelName in modelIvarNames) {
+            if ([ivarName isEqualToString:modelName]) {
+                @try {
+                    id model = object_getIvar(cell, cellIvars[i]);
+                    if (!model) continue;
+                    // Scan this model's ivars too
+                    unsigned int mIvarCount = 0;
+                    Ivar *mIvars = class_copyIvarList([model class], &mIvarCount);
+                    for (unsigned int j = 0; j < mIvarCount; j++) {
+                        const char *mType = ivar_getTypeEncoding(mIvars[j]);
+                        if (mType && mType[0] == '@') {
+                            id mVal = object_getIvar(model, mIvars[j]);
+                            if ([mVal isKindOfClass:[NSString class]]) {
+                                NSString *mStr = (NSString *)mVal;
+                                if ([mStr hasPrefix:@"t_"] || (mStr.length > 10 && [mStr longLongValue] > 0)) {
+                                    CFLOG(@"Found threadKey in model ivar '%s.%s': %@",
+                                          ivar_getName(cellIvars[i]), ivar_getName(mIvars[j]), mStr);
+                                    free(mIvars);
+                                    free(cellIvars);
+                                    return mStr;
+                                }
+                            }
+                        }
+                    }
+                    if (mIvars) free(mIvars);
+                } @catch (NSException *e) {}
+            }
+        }
+    }
+    if (cellIvars) free(cellIvars);
+
     CFLOG(@"WARNING: Could not extract threadKey from cell of class %@", NSStringFromClass([cell class]));
+    // Log the cell's class hierarchy for debugging
+    Class cls = [cell class];
+    while (cls) {
+        CFLOG(@"  Class hierarchy: %@", NSStringFromClass(cls));
+        cls = [cls superclass];
+        if (cls == [UIView class] || cls == [NSObject class]) break;
+    }
+
     return nil;
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - UI Helper: Present "Add to Folder" Action Sheet
+// MARK: - Folder Action Sheet
 // ═══════════════════════════════════════════════════════════
 
 static void presentFolderActionSheet(UIViewController *presenter, NSString *threadKey) {
@@ -168,10 +239,8 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
                          message:nil
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
-    // Current folder for this thread
     MSGChatFolder *currentFolder = [mgr folderForThreadKey:threadKey];
 
-    // List existing folders
     for (MSGChatFolder *folder in [mgr allFolders]) {
         NSString *title = folder.name;
         if ([folder.folderId isEqualToString:currentFolder.folderId]) {
@@ -179,9 +248,8 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
         }
         UIAlertAction *action = [UIAlertAction actionWithTitle:title
                                                          style:UIAlertActionStyleDefault
-                                                       handler:^(UIAlertAction * _Nonnull action) {
+                                                       handler:^(UIAlertAction *a) {
             if ([folder.folderId isEqualToString:currentFolder.folderId]) {
-                // Already in this folder — remove it
                 [mgr removeThreadKey:threadKey fromFolderId:folder.folderId];
             } else {
                 [mgr addThreadKey:threadKey toFolderId:folder.folderId];
@@ -190,20 +258,11 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
         [alert addAction:action];
     }
 
-    // Separator (visual — just using a disabled action)
-    if ([mgr allFolders].count > 0) {
-        UIAlertAction *sep = [UIAlertAction actionWithTitle:@"──────────"
-                                                     style:UIAlertActionStyleDefault
-                                                   handler:nil];
-        [sep setEnabled:NO];
-        [alert addAction:sep];
-    }
-
     // Create new folder
-    UIAlertAction *createAction = [UIAlertAction
+    [alert addAction:[UIAlertAction
         actionWithTitle:@"➕ Create New Folder"
                   style:UIAlertActionStyleDefault
-                handler:^(UIAlertAction * _Nonnull action) {
+                handler:^(UIAlertAction *a) {
         UIAlertController *nameAlert = [UIAlertController
             alertControllerWithTitle:@"New Folder"
                              message:@"Enter a name for the new folder"
@@ -216,7 +275,7 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
 
         [nameAlert addAction:[UIAlertAction actionWithTitle:@"Create"
                                                       style:UIAlertActionStyleDefault
-                                                    handler:^(UIAlertAction *a) {
+                                                    handler:^(UIAlertAction *a2) {
             NSString *name = nameAlert.textFields.firstObject.text;
             if (name.length > 0) {
                 MSGChatFolder *newFolder = [mgr createFolderWithName:name];
@@ -229,26 +288,21 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
                                                     handler:nil]];
 
         [presenter presentViewController:nameAlert animated:YES completion:nil];
-    }];
-    [alert addAction:createAction];
+    }]];
 
-    // Remove from folder (if currently in one)
     if (currentFolder) {
-        UIAlertAction *removeAction = [UIAlertAction
+        [alert addAction:[UIAlertAction
             actionWithTitle:@"❌ Remove from Folder"
                       style:UIAlertActionStyleDestructive
-                    handler:^(UIAlertAction * _Nonnull action) {
+                    handler:^(UIAlertAction *a) {
             [mgr removeThreadKeyFromAllFolders:threadKey];
-        }];
-        [alert addAction:removeAction];
+        }]];
     }
 
-    // Cancel
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
-    // iPad popover support
     if (alert.popoverPresentationController) {
         alert.popoverPresentationController.sourceView = presenter.view;
         alert.popoverPresentationController.sourceRect = CGRectMake(
@@ -259,10 +313,334 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - UI Helper: Folder Tab Delegate Handling
+// MARK: - Build Folder UIMenu (for context menu injection)
 // ═══════════════════════════════════════════════════════════
 
-/// Shows rename/delete options when long-pressing a folder tab
+/// Creates a UIMenu containing folder actions for a given threadKey.
+/// This is added directly into Messenger's native context menu.
+static UIMenu *buildFolderMenu(NSString *threadKey) {
+    MSGChatFolderManager *mgr = [MSGChatFolderManager sharedManager];
+    MSGChatFolder *currentFolder = [mgr folderForThreadKey:threadKey];
+    NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
+
+    // Existing folders
+    for (MSGChatFolder *folder in [mgr allFolders]) {
+        NSString *title = folder.name;
+        UIImage *image = nil;
+
+        if ([folder.folderId isEqualToString:currentFolder.folderId]) {
+            title = [NSString stringWithFormat:@"✓ %@", folder.name];
+            image = [UIImage systemImageNamed:@"folder.fill"];
+        } else {
+            image = [UIImage systemImageNamed:@"folder"];
+        }
+
+        UIAction *action = [UIAction actionWithTitle:title
+                                               image:image
+                                          identifier:nil
+                                             handler:^(__kindof UIAction *a) {
+            if ([folder.folderId isEqualToString:currentFolder.folderId]) {
+                [mgr removeThreadKey:threadKey fromFolderId:folder.folderId];
+            } else {
+                [mgr addThreadKey:threadKey toFolderId:folder.folderId];
+            }
+        }];
+        [actions addObject:action];
+    }
+
+    // Create new folder
+    UIAction *createAction = [UIAction actionWithTitle:@"New Folder..."
+                                                 image:[UIImage systemImageNamed:@"folder.badge.plus"]
+                                            identifier:nil
+                                               handler:^(__kindof UIAction *a) {
+        // Delay slightly so the context menu dismisses first
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *topVC = findTopViewController();
+            if (!topVC) return;
+
+            UIAlertController *nameAlert = [UIAlertController
+                alertControllerWithTitle:@"New Folder"
+                                 message:@"Enter a name for the new folder"
+                          preferredStyle:UIAlertControllerStyleAlert];
+
+            [nameAlert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                tf.placeholder = @"Folder name";
+                tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
+            }];
+
+            [nameAlert addAction:[UIAlertAction actionWithTitle:@"Create"
+                                                          style:UIAlertActionStyleDefault
+                                                        handler:^(UIAlertAction *a2) {
+                NSString *name = nameAlert.textFields.firstObject.text;
+                if (name.length > 0) {
+                    MSGChatFolder *newFolder = [mgr createFolderWithName:name];
+                    [mgr addThreadKey:threadKey toFolderId:newFolder.folderId];
+                }
+            }]];
+
+            [nameAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                          style:UIAlertActionStyleCancel
+                                                        handler:nil]];
+
+            [topVC presentViewController:nameAlert animated:YES completion:nil];
+        });
+    }];
+    [actions addObject:createAction];
+
+    // Remove from folder (if in one)
+    if (currentFolder) {
+        UIAction *removeAction = [UIAction actionWithTitle:@"Remove from Folder"
+                                                     image:[UIImage systemImageNamed:@"folder.badge.minus"]
+                                                identifier:nil
+                                                   handler:^(__kindof UIAction *a) {
+            [mgr removeThreadKeyFromAllFolders:threadKey];
+        }];
+        removeAction.attributes = UIMenuElementAttributesDestructive;
+        [actions addObject:removeAction];
+    }
+
+    UIMenu *folderMenu = [UIMenu menuWithTitle:@"Add to Folder"
+                                         image:[UIImage systemImageNamed:@"folder"]
+                                    identifier:@"com.msgchatfolders.menu"
+                                       options:0
+                                      children:actions];
+    return folderMenu;
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Context Menu Hook (injected into Messenger's delegate)
+// ═══════════════════════════════════════════════════════════
+
+/// Hooked version of collectionView:contextMenuConfigurationForItemAtIndexPath:point:
+/// Wraps Messenger's original context menu to add our folder action.
+static UIContextMenuConfiguration *hooked_contextMenuForItemAtIndex(
+    id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath, CGPoint point)
+{
+    // Call Messenger's original implementation
+    UIContextMenuConfiguration *original = orig_contextMenuForItemAtIndex(self, _cmd, cv, indexPath, point);
+
+    if (!original) {
+        CFLOG(@"Context menu: original returned nil for indexPath %@", indexPath);
+        return original;
+    }
+
+    // Get the cell and extract thread key
+    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
+    NSString *threadKey = extractThreadKeyFromCell(cell);
+
+    if (!threadKey) {
+        CFLOG(@"Context menu: no threadKey found at indexPath %@, returning original", indexPath);
+        return original;
+    }
+
+    CFLOG(@"Context menu: injecting folder action for threadKey=%@", threadKey);
+
+    // Extract the original preview and action providers via runtime introspection
+    UIContextMenuContentPreviewProvider origPreview = nil;
+    UIContextMenuActionProvider origActionProvider = nil;
+
+    // Try to access the stored blocks from the original configuration
+    Ivar previewIvar = class_getInstanceVariable([UIContextMenuConfiguration class], "_previewProvider");
+    Ivar actionIvar = class_getInstanceVariable([UIContextMenuConfiguration class], "_actionProvider");
+
+    if (previewIvar) {
+        origPreview = (__bridge UIContextMenuContentPreviewProvider)
+            ((__bridge void *)object_getIvar(original, previewIvar));
+    }
+    if (actionIvar) {
+        origActionProvider = (__bridge UIContextMenuActionProvider)
+            ((__bridge void *)object_getIvar(original, actionIvar));
+    }
+
+    // If we couldn't extract the action provider, try KVC as fallback
+    if (!origActionProvider) {
+        @try {
+            origActionProvider = [original valueForKey:@"_actionProvider"];
+        } @catch (NSException *e) {
+            CFLOG(@"Context menu: could not extract action provider: %@", e);
+        }
+    }
+
+    // Build our replacement action provider that includes the original + our folder action
+    UIContextMenuActionProvider wrappedActionProvider = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+        UIMenu *originalMenu = nil;
+
+        if (origActionProvider) {
+            originalMenu = origActionProvider(suggestedActions);
+        }
+
+        // Build our folder submenu
+        UIMenu *folderMenu = buildFolderMenu(threadKey);
+
+        if (originalMenu) {
+            // Wrap folder menu as an inline section to separate it visually
+            UIMenu *folderSection = [UIMenu menuWithTitle:@""
+                                                    image:nil
+                                               identifier:@"com.msgchatfolders.section"
+                                                  options:UIMenuOptionsDisplayInline
+                                                 children:@[folderMenu]];
+
+            NSMutableArray *allChildren = [originalMenu.children mutableCopy];
+            [allChildren addObject:folderSection];
+            return [originalMenu menuByReplacingChildren:allChildren];
+        } else {
+            // No original menu — just show ours (shouldn't happen normally)
+            return [UIMenu menuWithTitle:@"" children:@[folderMenu]];
+        }
+    };
+
+    // Create new configuration preserving the original preview
+    UIContextMenuConfiguration *newConfig = [UIContextMenuConfiguration
+        configurationWithIdentifier:nil
+                    previewProvider:origPreview
+                     actionProvider:wrappedActionProvider];
+
+    return newConfig;
+}
+
+/// Hooked version for iOS 16+ multi-item context menu
+static UIContextMenuConfiguration *hooked_contextMenuForItemsAtIndices(
+    id self, SEL _cmd, UICollectionView *cv, NSArray *indexPaths, CGPoint point)
+{
+    UIContextMenuConfiguration *original = orig_contextMenuForItemsAtIndices(self, _cmd, cv, indexPaths, point);
+
+    if (!original || indexPaths.count == 0) return original;
+
+    NSIndexPath *indexPath = indexPaths.firstObject;
+    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
+    NSString *threadKey = extractThreadKeyFromCell(cell);
+
+    if (!threadKey) return original;
+
+    CFLOG(@"Context menu (multi): injecting folder action for threadKey=%@", threadKey);
+
+    // Same wrapping logic as above
+    UIContextMenuActionProvider origActionProvider = nil;
+    UIContextMenuContentPreviewProvider origPreview = nil;
+
+    Ivar previewIvar = class_getInstanceVariable([UIContextMenuConfiguration class], "_previewProvider");
+    Ivar actionIvar = class_getInstanceVariable([UIContextMenuConfiguration class], "_actionProvider");
+
+    if (previewIvar) {
+        origPreview = (__bridge UIContextMenuContentPreviewProvider)
+            ((__bridge void *)object_getIvar(original, previewIvar));
+    }
+    if (actionIvar) {
+        origActionProvider = (__bridge UIContextMenuActionProvider)
+            ((__bridge void *)object_getIvar(original, actionIvar));
+    }
+
+    if (!origActionProvider) {
+        @try {
+            origActionProvider = [original valueForKey:@"_actionProvider"];
+        } @catch (NSException *e) {}
+    }
+
+    UIContextMenuActionProvider wrappedProvider = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+        UIMenu *originalMenu = origActionProvider ? origActionProvider(suggestedActions) : nil;
+        UIMenu *folderMenu = buildFolderMenu(threadKey);
+        UIMenu *folderSection = [UIMenu menuWithTitle:@""
+                                                image:nil
+                                           identifier:@"com.msgchatfolders.section"
+                                              options:UIMenuOptionsDisplayInline
+                                             children:@[folderMenu]];
+
+        if (originalMenu) {
+            NSMutableArray *allChildren = [originalMenu.children mutableCopy];
+            [allChildren addObject:folderSection];
+            return [originalMenu menuByReplacingChildren:allChildren];
+        }
+        return [UIMenu menuWithTitle:@"" children:@[folderMenu]];
+    };
+
+    return [UIContextMenuConfiguration configurationWithIdentifier:nil
+                                                   previewProvider:origPreview
+                                                    actionProvider:wrappedProvider];
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Dynamic Context Menu Hook Registration
+// ═══════════════════════════════════════════════════════════
+
+/// Dynamically hooks the context menu method on whatever class is serving
+/// as the collection view's delegate. Called once after we find the collection view.
+static void hookContextMenuOnDelegate(UICollectionView *cv) {
+    id delegate = cv.delegate;
+    if (!delegate) {
+        CFLOG(@"Context menu hook: collection view has no delegate");
+        return;
+    }
+
+    Class delegateClass = [delegate class];
+    NSString *delegateClassName = NSStringFromClass(delegateClass);
+
+    // Check if already hooked
+    NSNumber *alreadyHooked = objc_getAssociatedObject(delegateClass, kContextMenuHookedKey);
+    if ([alreadyHooked boolValue]) {
+        CFLOG(@"Context menu: already hooked on %@", delegateClassName);
+        return;
+    }
+
+    CFLOG(@"Context menu: attempting to hook delegate class: %@", delegateClassName);
+
+    // Try iOS 13+ single-item method
+    SEL singleSel = @selector(collectionView:contextMenuConfigurationForItemAtIndexPath:point:);
+    if ([delegate respondsToSelector:singleSel]) {
+        Method method = class_getInstanceMethod(delegateClass, singleSel);
+        if (method) {
+            orig_contextMenuForItemAtIndex = (UIContextMenuConfiguration *(*)(id, SEL, UICollectionView *, NSIndexPath *, CGPoint))
+                method_getImplementation(method);
+            method_setImplementation(method, (IMP)hooked_contextMenuForItemAtIndex);
+            CFLOG(@"✅ Hooked contextMenuConfigurationForItemAtIndexPath: on %@", delegateClassName);
+            objc_setAssociatedObject(delegateClass, kContextMenuHookedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
+    // Try iOS 16+ multi-item method
+    SEL multiSel = @selector(collectionView:contextMenuConfigurationForItemsAtIndexPaths:point:);
+    if ([delegate respondsToSelector:multiSel]) {
+        Method method = class_getInstanceMethod(delegateClass, multiSel);
+        if (method) {
+            orig_contextMenuForItemsAtIndices = (UIContextMenuConfiguration *(*)(id, SEL, UICollectionView *, NSArray *, CGPoint))
+                method_getImplementation(method);
+            method_setImplementation(method, (IMP)hooked_contextMenuForItemsAtIndices);
+            CFLOG(@"✅ Hooked contextMenuConfigurationForItemsAtIndexPaths: on %@", delegateClassName);
+            objc_setAssociatedObject(delegateClass, kContextMenuHookedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
+    if (![alreadyHooked boolValue] &&
+        ![delegate respondsToSelector:singleSel] &&
+        ![delegate respondsToSelector:multiSel]) {
+        CFLOG(@"⚠️ Delegate %@ does not implement any context menu methods!", delegateClassName);
+        CFLOG(@"  Will search for UIContextMenuInteraction on the collection view instead...");
+
+        // Fallback: Check if the collection view has a UIContextMenuInteraction
+        for (UIInteraction *interaction in cv.interactions) {
+            if ([interaction isKindOfClass:[UIContextMenuInteraction class]]) {
+                UIContextMenuInteraction *ctxInteraction = (UIContextMenuInteraction *)interaction;
+                id ctxDelegate = ctxInteraction.delegate;
+                if (ctxDelegate) {
+                    Class ctxDelegateClass = [ctxDelegate class];
+                    CFLOG(@"Found UIContextMenuInteraction delegate: %@", NSStringFromClass(ctxDelegateClass));
+
+                    // Hook contextMenuInteraction:configurationForMenuAtLocation:
+                    SEL ctxSel = @selector(contextMenuInteraction:configurationForMenuAtLocation:);
+                    if ([ctxDelegate respondsToSelector:ctxSel]) {
+                        CFLOG(@"  Delegate responds to contextMenuInteraction:configurationForMenuAtLocation:");
+                        // Store for future implementation if needed
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Folder Tab Delegate Handling
+// ═══════════════════════════════════════════════════════════
+
 static void handleFolderTabLongPress(UIViewController *presenter, NSString *folderId) {
     MSGChatFolderManager *mgr = [MSGChatFolderManager sharedManager];
     MSGChatFolder *folder = nil;
@@ -280,7 +658,6 @@ static void handleFolderTabLongPress(UIViewController *presenter, NSString *fold
                                   (unsigned long)folder.threadKeys.count]
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
-    // Rename
     [alert addAction:[UIAlertAction actionWithTitle:@"✏️ Rename"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -288,13 +665,10 @@ static void handleFolderTabLongPress(UIViewController *presenter, NSString *fold
             alertControllerWithTitle:@"Rename Folder"
                              message:nil
                       preferredStyle:UIAlertControllerStyleAlert];
-
         [renameAlert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
             tf.text = folder.name;
             tf.placeholder = @"New name";
-            tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
         }];
-
         [renameAlert addAction:[UIAlertAction actionWithTitle:@"Save"
                                                        style:UIAlertActionStyleDefault
                                                      handler:^(UIAlertAction *a2) {
@@ -303,38 +677,30 @@ static void handleFolderTabLongPress(UIViewController *presenter, NSString *fold
                 [mgr renameFolderWithId:folderId toName:newName];
             }
         }]];
-
         [renameAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                                        style:UIAlertActionStyleCancel
                                                      handler:nil]];
-
         [presenter presentViewController:renameAlert animated:YES completion:nil];
     }]];
 
-    // Delete
-    [alert addAction:[UIAlertAction
-        actionWithTitle:@"🗑 Delete Folder"
-                  style:UIAlertActionStyleDestructive
-                handler:^(UIAlertAction *a) {
-        UIAlertController *confirmAlert = [UIAlertController
+    [alert addAction:[UIAlertAction actionWithTitle:@"🗑 Delete Folder"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+        UIAlertController *confirm = [UIAlertController
             alertControllerWithTitle:@"Delete Folder?"
                              message:[NSString stringWithFormat:
-                                @"Are you sure you want to delete \"%@\"? "
-                                "Conversations won't be deleted, just unassigned from this folder.",
+                                @"Delete \"%@\"? Conversations won't be deleted.",
                                 folder.name]
                       preferredStyle:UIAlertControllerStyleAlert];
-
-        [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Delete"
-                                                        style:UIAlertActionStyleDestructive
-                                                      handler:^(UIAlertAction *a2) {
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Delete"
+                                                   style:UIAlertActionStyleDestructive
+                                                 handler:^(UIAlertAction *a2) {
             [mgr deleteFolderWithId:folderId];
         }]];
-
-        [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                                        style:UIAlertActionStyleCancel
-                                                      handler:nil]];
-
-        [presenter presentViewController:confirmAlert animated:YES completion:nil];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                   style:UIAlertActionStyleCancel
+                                                 handler:nil]];
+        [presenter presentViewController:confirm animated:YES completion:nil];
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
@@ -354,16 +720,15 @@ static void handleFolderTabLongPress(UIViewController *presenter, NSString *fold
 // MARK: - Hook 1: Inject Folder Tab Bar into Inbox
 // ═══════════════════════════════════════════════════════════
 
-/// Replacement for MSGInboxViewController's viewDidAppear:
-/// Injects the folder tab bar if not already present.
 static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
     // Call original
     orig_inboxViewDidAppear(self, _cmd, animated);
 
-    // Only inject once
+    UIViewController *vc = (UIViewController *)self;
+
+    // Only inject once per VC instance
     NSNumber *initialized = objc_getAssociatedObject(self, kFolderInitializedKey);
     if ([initialized boolValue]) {
-        // Tab already injected — just reload it
         MSGChatFolderTabView *tabView = objc_getAssociatedObject(self, kFolderTabViewKey);
         [tabView reloadTabs];
         return;
@@ -372,51 +737,63 @@ static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
 
     CFLOG(@"Injecting folder tab bar into %@", NSStringFromClass([self class]));
 
-    UIViewController *vc = (UIViewController *)self;
+    // Find the collection view (conversation list)
+    UICollectionView *mainCV = nil;
 
-    // Find the collection view or table view in the hierarchy
-    UIScrollView *mainScrollView = nil;
+    // Search direct subviews first
     for (UIView *subview in vc.view.subviews) {
-        if ([subview isKindOfClass:[UICollectionView class]] ||
-            [subview isKindOfClass:[UITableView class]] ||
-            [subview isKindOfClass:[UIScrollView class]]) {
-            mainScrollView = (UIScrollView *)subview;
+        if ([subview isKindOfClass:[UICollectionView class]]) {
+            mainCV = (UICollectionView *)subview;
             break;
         }
     }
 
-    // If not found at top level, search deeper (one level)
-    if (!mainScrollView) {
+    // Search one level deeper if not found
+    if (!mainCV) {
         for (UIView *subview in vc.view.subviews) {
             for (UIView *child in subview.subviews) {
-                if ([child isKindOfClass:[UICollectionView class]] ||
-                    [child isKindOfClass:[UITableView class]]) {
-                    mainScrollView = (UIScrollView *)child;
+                if ([child isKindOfClass:[UICollectionView class]]) {
+                    mainCV = (UICollectionView *)child;
                     break;
                 }
             }
-            if (mainScrollView) break;
+            if (mainCV) break;
         }
     }
 
-    CGFloat tabHeight = [MSGChatFolderTabView preferredHeight];
+    // Search even deeper (up to 4 levels)
+    if (!mainCV) {
+        NSMutableArray *queue = [vc.view.subviews mutableCopy];
+        int depth = 0;
+        while (queue.count > 0 && depth < 4 && !mainCV) {
+            NSMutableArray *nextLevel = [NSMutableArray array];
+            for (UIView *v in queue) {
+                if ([v isKindOfClass:[UICollectionView class]]) {
+                    mainCV = (UICollectionView *)v;
+                    break;
+                }
+                [nextLevel addObjectsFromArray:v.subviews];
+            }
+            queue = nextLevel;
+            depth++;
+        }
+    }
 
-    // Create the tab view
+    // Create and inject the folder tab bar
+    CGFloat tabHeight = [MSGChatFolderTabView preferredHeight];
     MSGChatFolderTabView *tabView = [[MSGChatFolderTabView alloc]
         initWithFrame:CGRectMake(0, 0, vc.view.bounds.size.width, tabHeight)];
     tabView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     tabView.selectedFolderId = [MSGChatFolderManager sharedManager].selectedFolderId;
 
-    // Store reference
     objc_setAssociatedObject(self, kFolderTabViewKey, tabView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // Create a delegate shim using a block-based approach (objc_setAssociatedObject)
-    // We'll handle delegate calls by checking in the tab view's action methods
+    if (mainCV) {
+        // Store collection view reference
+        objc_setAssociatedObject(self, kCollectionViewRefKey, mainCV, OBJC_ASSOCIATION_ASSIGN);
 
-    if (mainScrollView) {
-        // Insert as a header view above the scroll view
-        // Adjust the scroll view's frame to make room
-        CGRect scrollFrame = mainScrollView.frame;
+        // Insert tab bar above the collection view
+        CGRect scrollFrame = mainCV.frame;
         CGFloat originalY = scrollFrame.origin.y;
 
         tabView.frame = CGRectMake(0, originalY, vc.view.bounds.size.width, tabHeight);
@@ -424,154 +801,33 @@ static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
 
         scrollFrame.origin.y += tabHeight;
         scrollFrame.size.height -= tabHeight;
-        mainScrollView.frame = scrollFrame;
+        mainCV.frame = scrollFrame;
 
-        CFLOG(@"Tab bar injected. ScrollView class: %@, new Y: %.0f",
-              NSStringFromClass([mainScrollView class]), scrollFrame.origin.y);
+        CFLOG(@"Tab bar injected. CV class: %@, delegate: %@",
+              NSStringFromClass([mainCV class]),
+              NSStringFromClass([mainCV.delegate class]));
+
+        // ── Hook the context menu on this collection view's delegate ──
+        hookContextMenuOnDelegate(mainCV);
+
     } else {
-        // Fallback: just add it to the top of the view
+        // Fallback: add at the top
         CGFloat safeTop = 0;
         if (@available(iOS 11.0, *)) {
             safeTop = vc.view.safeAreaInsets.top;
         }
         tabView.frame = CGRectMake(0, safeTop, vc.view.bounds.size.width, tabHeight);
         [vc.view addSubview:tabView];
-        CFLOG(@"Tab bar injected (fallback, no scroll view found)");
+        CFLOG(@"Tab bar injected (fallback, no collection view found)");
     }
 
     [tabView reloadTabs];
-
-    // Set up a notification-based callback for folder selection and creation
-    // The tab view will post notifications, and we handle them here
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - Hook 2: UICollectionView Context Menu
+// MARK: - Class Reconnaissance
 // ═══════════════════════════════════════════════════════════
 
-/// We swizzle UICollectionViewDelegate's contextMenuConfigurationForItemAt
-/// to inject our "Add to Folder" action into the preview's action list.
-/// This is a broad hook — we check if we're in a Messenger inbox context first.
-static id hooked_contextMenuConfig(id self, SEL _cmd, id collectionView, id indexPath, id point) {
-    id original = orig_contextMenuConfig(self, _cmd, collectionView, indexPath, point);
-
-    // Only modify if we're in the inbox context
-    UIResponder *responder = (UIResponder *)self;
-    BOOL isInbox = NO;
-    for (int i = 0; i < 10 && responder; i++) {
-        NSString *className = NSStringFromClass([responder class]);
-        if ([className containsString:@"Inbox"] ||
-            [className containsString:@"ThreadList"] ||
-            [className containsString:@"ConversationList"] ||
-            [className containsString:@"CommunityList"]) {
-            isInbox = YES;
-            break;
-        }
-        responder = [responder nextResponder];
-    }
-
-    if (!isInbox) return original;
-
-    // Try to extract thread key from the cell at this index path
-    UICollectionView *cv = (UICollectionView *)collectionView;
-    NSIndexPath *ip = (NSIndexPath *)indexPath;
-    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:ip];
-    NSString *threadKey = extractThreadKeyFromCell(cell);
-
-    if (!threadKey) {
-        CFLOG(@"Context menu: could not extract threadKey for indexPath %@", ip);
-        return original;
-    }
-
-    CFLOG(@"Context menu: threadKey=%@ at indexPath=%@", threadKey, ip);
-
-    // We can't easily modify a UIContextMenuConfiguration's action provider after creation.
-    // Instead, we'll add a separate long-press gesture recognizer in the viewDidAppear hook.
-    // But if `original` is nil, we create our own.
-    // For now, we rely on the separate long-press approach (see below).
-
-    return original;
-}
-
-// ═══════════════════════════════════════════════════════════
-// MARK: - Hook 3: Long Press on Conversation Cell
-// ═══════════════════════════════════════════════════════════
-
-/// We add an additional UILongPressGestureRecognizer to the collection view
-/// that detects long-presses on conversation cells and shows our folder menu
-/// AFTER the system context menu is dismissed (or alongside it).
-///
-/// This approach is used because Messenger's context menu system varies between
-/// versions, but long-press gestures always work.
-static void addFolderLongPressToCollectionView(UICollectionView *cv, UIViewController *vc) {
-    // Check if we already added our gesture
-    for (UIGestureRecognizer *gr in cv.gestureRecognizers) {
-        if (gr.name && [gr.name isEqualToString:@"MSGChatFoldersLongPress"]) {
-            return;  // Already added
-        }
-    }
-
-    // We'll use a 3D Touch / long press with a longer duration so it doesn't
-    // conflict with Messenger's own context menu
-    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
-        initWithTarget:vc action:NSSelectorFromString(@"msgcf_handleFolderLongPress:")];
-    longPress.minimumPressDuration = 1.0;  // Slightly longer than default to not conflict
-    longPress.name = @"MSGChatFoldersLongPress";
-
-    // Don't interfere with existing gesture recognizers
-    longPress.cancelsTouchesInView = NO;
-    longPress.delaysTouchesBegan = NO;
-
-    [cv addGestureRecognizer:longPress];
-    CFLOG(@"Added folder long-press gesture to collection view");
-}
-
-/// Handler for our custom long-press gesture recognizer.
-/// This method is added to the view controller class at runtime.
-static void msgcf_handleFolderLongPress(id self, SEL _cmd, UILongPressGestureRecognizer *gesture) {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-
-    UICollectionView *cv = (UICollectionView *)gesture.view;
-    if (![cv isKindOfClass:[UICollectionView class]]) return;
-
-    CGPoint point = [gesture locationInView:cv];
-    NSIndexPath *indexPath = [cv indexPathForItemAtPoint:point];
-    if (!indexPath) return;
-
-    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
-    NSString *threadKey = extractThreadKeyFromCell(cell);
-
-    if (threadKey) {
-        UIViewController *vc = (UIViewController *)self;
-        presentFolderActionSheet(vc, threadKey);
-    } else {
-        CFLOG(@"Long press: could not extract threadKey at %@", indexPath);
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// MARK: - Reconnaissance (Class Discovery)
-// ═══════════════════════════════════════════════════════════
-
-/// Logs the view hierarchy of the inbox for debugging.
-/// This helps identify the exact class names in case hooks need updating.
-static void logViewHierarchy(UIView *view, int depth) {
-    if (depth > 6) return;  // Don't go too deep
-
-    NSMutableString *indent = [NSMutableString string];
-    for (int i = 0; i < depth; i++) [indent appendString:@"  "];
-
-    CFLOG(@"%@%@ frame=%@ tag=%ld",
-          indent, NSStringFromClass([view class]),
-          NSStringFromCGRect(view.frame), (long)view.tag);
-
-    for (UIView *sub in view.subviews) {
-        logViewHierarchy(sub, depth + 1);
-    }
-}
-
-/// Logs all loaded classes that match Messenger naming patterns.
-/// Run once at startup for reconnaissance.
 static void logMessengerClasses(void) {
     CFLOG(@"=== MESSENGER CLASS RECONNAISSANCE ===");
 
@@ -597,7 +853,6 @@ static void logMessengerClasses(void) {
     }
     free(classes);
 
-    // Sort and log
     [relevantClasses sortUsingSelector:@selector(compare:)];
     for (NSString *cls in relevantClasses) {
         CFLOG(@"  Found class: %@", cls);
@@ -610,8 +865,6 @@ static void logMessengerClasses(void) {
 // MARK: - Swizzle Utility
 // ═══════════════════════════════════════════════════════════
 
-/// Safely swizzles an instance method, storing the original IMP.
-/// Returns YES if swizzling succeeded.
 static BOOL swizzleMethod(Class cls, SEL originalSel, IMP replacementIMP, IMP *outOriginalIMP) {
     if (!cls) {
         CFLOG(@"Swizzle failed: class is nil for %@", NSStringFromSelector(originalSel));
@@ -625,20 +878,15 @@ static BOOL swizzleMethod(Class cls, SEL originalSel, IMP replacementIMP, IMP *o
         return NO;
     }
 
-    // Get the original IMP
     IMP origIMP = method_getImplementation(method);
     if (outOriginalIMP) {
         *outOriginalIMP = origIMP;
     }
 
-    // Try to add the method first (in case it's inherited)
     const char *types = method_getTypeEncoding(method);
     if (class_addMethod(cls, originalSel, replacementIMP, types)) {
-        // Method was added (was inherited), now get the super's version
-        // The original IMP we captured above is correct
         CFLOG(@"Added method %@ to %@ (was inherited)", NSStringFromSelector(originalSel), NSStringFromClass(cls));
     } else {
-        // Method exists on this class, replace it directly
         method_setImplementation(method, replacementIMP);
     }
 
@@ -646,7 +894,6 @@ static BOOL swizzleMethod(Class cls, SEL originalSel, IMP replacementIMP, IMP *o
     return YES;
 }
 
-/// Adds a new method to a class at runtime.
 static BOOL addMethod(Class cls, SEL sel, IMP imp, const char *types) {
     if (!cls) return NO;
     BOOL result = class_addMethod(cls, sel, imp, types);
@@ -663,10 +910,8 @@ static BOOL addMethod(Class cls, SEL sel, IMP imp, const char *types) {
 void MSGChatFolders_RegisterHooks(void) {
     CFLOG(@"Registering hooks...");
 
-    // Run reconnaissance to discover available classes
+    // Run reconnaissance
     logMessengerClasses();
-
-    // ── Hook 1: Inbox View Controller ──
 
     // Try multiple possible class names for the inbox VC
     NSArray *inboxClassNames = @[
@@ -688,19 +933,11 @@ void MSGChatFolders_RegisterHooks(void) {
     }
 
     if (inboxClass) {
-        // Hook viewDidAppear:
         swizzleMethod(inboxClass,
                       @selector(viewDidAppear:),
                       (IMP)hooked_inboxViewDidAppear,
                       (IMP *)&orig_inboxViewDidAppear);
 
-        // Add our long-press handler method to the class
-        addMethod(inboxClass,
-                  NSSelectorFromString(@"msgcf_handleFolderLongPress:"),
-                  (IMP)msgcf_handleFolderLongPress,
-                  "v@:@");
-
-        // Add folder tab delegate methods
         addMethod(inboxClass,
                   NSSelectorFromString(@"msgcf_folderTabDidSelect:"),
                   (IMP)msgcf_folderTabDidSelect,
@@ -716,7 +953,7 @@ void MSGChatFolders_RegisterHooks(void) {
                   (IMP)msgcf_folderTabDidLongPress,
                   "v@:@");
     } else {
-        CFLOG(@"WARNING: No inbox view controller class found! Tab bar will not be injected.");
+        CFLOG(@"WARNING: No inbox view controller class found!");
         CFLOG(@"Check the reconnaissance log above for available classes.");
     }
 
@@ -724,26 +961,26 @@ void MSGChatFolders_RegisterHooks(void) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - Tab View Delegate Shim (Added to Inbox VC)
+// MARK: - Tab View Delegate Shim
 // ═══════════════════════════════════════════════════════════
-
-/// These functions are added as methods to the inbox VC class at runtime.
-/// They bridge the MSGChatFolderTabView delegate protocol.
 
 static void msgcf_folderTabDidSelect(id self, SEL _cmd, NSNotification *note) {
     NSString *folderId = note.userInfo[@"folderId"];
     if (!folderId) return;
-
     [[MSGChatFolderManager sharedManager] setSelectedFolderId:folderId];
 
-    // Force the collection view to reload
     UIViewController *vc = (UIViewController *)self;
-    for (UIView *subview in vc.view.subviews) {
-        if ([subview isKindOfClass:[UICollectionView class]]) {
-            UICollectionView *cv = (UICollectionView *)subview;
-            [cv reloadData];
-            CFLOG(@"Reloaded collection view for folder: %@", folderId);
-            break;
+    UICollectionView *cv = objc_getAssociatedObject(self, kCollectionViewRefKey);
+    if (cv) {
+        [cv reloadData];
+        CFLOG(@"Reloaded collection view for folder: %@", folderId);
+    } else {
+        // Search for any collection view in the VC
+        for (UIView *sub in vc.view.subviews) {
+            if ([sub isKindOfClass:[UICollectionView class]]) {
+                [(UICollectionView *)sub reloadData];
+                break;
+            }
         }
     }
 }
