@@ -2,41 +2,33 @@
 //  MSGChatFolderTabView.m
 //  MSGChatFolders — Messenger Chat Folders Tweak
 //
-//  Horizontal scrollable tab bar with assign mode toggle.
+//  Horizontal scrollable tab bar. The 📂 button posts a notification
+//  so the hooks layer can read visible cells and show a conversation picker.
 //
 
 #import "MSGChatFolderTabView.h"
 #import "MSGChatFolderManager.h"
 
-// ── Global assign mode state ──
-BOOL MSGChatFolders_assignModeActive = NO;
-NSString *const MSGChatFoldersAssignModeChangedNotification = @"MSGChatFoldersAssignModeChanged";
+NSString *const MSGChatFoldersShowPickerNotification = @"MSGChatFoldersShowPicker";
 
 static const CGFloat kTabHeight       = 36.0;
 static const CGFloat kTabViewPadding  = 8.0;
 static const CGFloat kTabSpacing      = 8.0;
 static const CGFloat kTabHPadding     = 14.0;
 static const CGFloat kTabCornerRadius = 18.0;
-static const CGFloat kBannerHeight    = 32.0;
 static const NSInteger kTagBase       = 7000;
 
 @interface MSGChatFolderTabView ()
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *tabButtons;
 @property (nonatomic, strong) UIButton *addButton;
-@property (nonatomic, strong) UIButton *assignButton;
-@property (nonatomic, strong) UIView *assignBanner;
-@property (nonatomic, strong) UILabel *bannerLabel;
+@property (nonatomic, strong) UIButton *pickButton;
 @end
 
 @implementation MSGChatFolderTabView
 
 + (CGFloat)preferredHeight {
-    CGFloat base = kTabHeight + (kTabViewPadding * 2);
-    if (MSGChatFolders_assignModeActive) {
-        base += kBannerHeight;
-    }
-    return base;
+    return kTabHeight + (kTabViewPadding * 2);
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -80,40 +72,24 @@ static const NSInteger kTagBase       = 7000;
     self.addButton.layer.borderWidth = 1.5;
     [self.scrollView addSubview:self.addButton];
 
-    // "📂" button (assign mode toggle)
-    self.assignButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.assignButton setTitle:@"📂" forState:UIControlStateNormal];
-    self.assignButton.titleLabel.font = [UIFont systemFontOfSize:16];
-    [self.assignButton addTarget:self action:@selector(assignButtonTapped) forControlEvents:UIControlEventTouchUpInside];
-    self.assignButton.layer.cornerRadius = kTabCornerRadius;
-    self.assignButton.layer.borderWidth = 1.5;
-    [self.scrollView addSubview:self.assignButton];
-
-    // Assign mode banner (hidden by default)
-    self.assignBanner = [[UIView alloc] init];
-    self.assignBanner.hidden = YES;
-    self.assignBanner.layer.cornerRadius = 6;
-    [self addSubview:self.assignBanner];
-
-    self.bannerLabel = [[UILabel alloc] init];
-    self.bannerLabel.text = @"📂 Tap a conversation to assign it to a folder • Tap 📂 to exit";
-    self.bannerLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    self.bannerLabel.textAlignment = NSTextAlignmentCenter;
-    self.bannerLabel.adjustsFontSizeToFitWidth = YES;
-    self.bannerLabel.minimumScaleFactor = 0.7;
-    [self.assignBanner addSubview:self.bannerLabel];
+    // "📂" button (pick conversation to assign)
+    self.pickButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.pickButton setTitle:@"📂" forState:UIControlStateNormal];
+    self.pickButton.titleLabel.font = [UIFont systemFontOfSize:16];
+    [self.pickButton addTarget:self action:@selector(pickButtonTapped) forControlEvents:UIControlEventTouchUpInside];
+    self.pickButton.layer.cornerRadius = kTabCornerRadius;
+    self.pickButton.layer.borderWidth = 1.5;
+    [self.scrollView addSubview:self.pickButton];
 }
 
 #pragma mark - Reload
 
 - (void)reloadTabs {
-    // Remove old buttons
     for (UIButton *btn in self.tabButtons) {
         [btn removeFromSuperview];
     }
     [self.tabButtons removeAllObjects];
 
-    // Detect dark mode
     BOOL isDark = NO;
     if (@available(iOS 13.0, *)) {
         isDark = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
@@ -126,7 +102,6 @@ static const NSInteger kTagBase       = 7000;
     UIColor *textNormal   = isDark ? [UIColor colorWithWhite:0.85 alpha:1.0]
                                    : [UIColor colorWithWhite:0.3 alpha:1.0];
     UIColor *textSelected = [UIColor whiteColor];
-    UIColor *assignActive = [UIColor colorWithRed:1.0 green:0.6 blue:0.0 alpha:1.0]; // Orange
 
     // "All" button
     UIButton *allBtn = [self makeTabButtonWithTitle:@"All" tag:0];
@@ -148,7 +123,7 @@ static const NSInteger kTagBase       = 7000;
         [self.scrollView addSubview:btn];
     }
 
-    // Layout all buttons
+    // Layout
     CGFloat x = 0;
     for (UIButton *btn in self.tabButtons) {
         [btn sizeToFit];
@@ -161,49 +136,25 @@ static const NSInteger kTagBase       = 7000;
         [btn setTitleColor:isSelected ? textSelected : textNormal forState:UIControlStateNormal];
     }
 
+    UIColor *borderColor = isDark ? [UIColor colorWithWhite:0.4 alpha:1.0]
+                                  : [UIColor colorWithWhite:0.75 alpha:1.0];
+
     // "+" button
     self.addButton.frame = CGRectMake(x, kTabViewPadding, kTabHeight, kTabHeight);
-    self.addButton.layer.borderColor = isDark ? [UIColor colorWithWhite:0.4 alpha:1.0].CGColor
-                                              : [UIColor colorWithWhite:0.75 alpha:1.0].CGColor;
+    self.addButton.layer.borderColor = borderColor.CGColor;
     [self.addButton setTitleColor:textNormal forState:UIControlStateNormal];
     self.addButton.backgroundColor = [UIColor clearColor];
     x += kTabHeight + kTabSpacing;
 
     // "📂" button
-    self.assignButton.frame = CGRectMake(x, kTabViewPadding, kTabHeight, kTabHeight);
-    if (MSGChatFolders_assignModeActive) {
-        self.assignButton.backgroundColor = assignActive;
-        self.assignButton.layer.borderColor = assignActive.CGColor;
-    } else {
-        self.assignButton.backgroundColor = [UIColor clearColor];
-        self.assignButton.layer.borderColor = isDark ? [UIColor colorWithWhite:0.4 alpha:1.0].CGColor
-                                                     : [UIColor colorWithWhite:0.75 alpha:1.0].CGColor;
-    }
+    self.pickButton.frame = CGRectMake(x, kTabViewPadding, kTabHeight, kTabHeight);
+    self.pickButton.layer.borderColor = borderColor.CGColor;
+    self.pickButton.backgroundColor = [UIColor clearColor];
     x += kTabHeight + kTabSpacing;
 
     self.scrollView.contentSize = CGSizeMake(x, kTabHeight + (kTabViewPadding * 2));
-
-    // Scroll view frame (leave room for banner if active)
     self.scrollView.frame = CGRectMake(0, 0, self.bounds.size.width,
                                        kTabHeight + (kTabViewPadding * 2));
-
-    // Banner
-    self.assignBanner.hidden = !MSGChatFolders_assignModeActive;
-    if (MSGChatFolders_assignModeActive) {
-        CGFloat bannerY = kTabHeight + (kTabViewPadding * 2);
-        self.assignBanner.frame = CGRectMake(kTabViewPadding, bannerY,
-                                             self.bounds.size.width - (kTabViewPadding * 2),
-                                             kBannerHeight);
-        self.bannerLabel.frame = CGRectMake(8, 0,
-                                            self.assignBanner.bounds.size.width - 16,
-                                            kBannerHeight);
-        self.assignBanner.backgroundColor = isDark
-            ? [UIColor colorWithRed:0.3 green:0.2 blue:0.0 alpha:1.0]
-            : [UIColor colorWithRed:1.0 green:0.95 blue:0.8 alpha:1.0];
-        self.bannerLabel.textColor = isDark
-            ? [UIColor colorWithRed:1.0 green:0.8 blue:0.4 alpha:1.0]
-            : [UIColor colorWithRed:0.5 green:0.3 blue:0.0 alpha:1.0];
-    }
 }
 
 - (UIButton *)makeTabButtonWithTitle:(NSString *)title tag:(NSInteger)tag {
@@ -264,53 +215,18 @@ static const NSInteger kTagBase       = 7000;
     }
 }
 
-- (void)assignButtonTapped {
-    MSGChatFolders_assignModeActive = !MSGChatFolders_assignModeActive;
-    NSLog(@"[MSGChatFolders] Assign mode: %@", MSGChatFolders_assignModeActive ? @"ON" : @"OFF");
-
-    // Resize ourselves to account for banner
-    CGFloat newHeight = kTabHeight + (kTabViewPadding * 2);
-    if (MSGChatFolders_assignModeActive) {
-        newHeight += kBannerHeight;
-    }
-
-    // Animate the change
-    [UIView animateWithDuration:0.25 animations:^{
-        CGRect frame = self.frame;
-        CGFloat delta = newHeight - frame.size.height;
-        frame.size.height = newHeight;
-        self.frame = frame;
-
-        // Also adjust the collection view below us
-        UIView *superview = self.superview;
-        if (superview) {
-            for (UIView *sibling in superview.subviews) {
-                if ([sibling isKindOfClass:[UICollectionView class]] ||
-                    [sibling isKindOfClass:[UIScrollView class]]) {
-                    if (sibling.frame.origin.y > self.frame.origin.y && sibling != self) {
-                        CGRect sf = sibling.frame;
-                        sf.origin.y += delta;
-                        sf.size.height -= delta;
-                        sibling.frame = sf;
-                    }
-                }
-            }
-        }
-    }];
-
-    [self reloadTabs];
-
+- (void)pickButtonTapped {
+    NSLog(@"[MSGChatFolders] 📂 Pick button tapped — posting notification");
     [[NSNotificationCenter defaultCenter]
-        postNotificationName:MSGChatFoldersAssignModeChangedNotification
-                      object:nil
-                    userInfo:@{@"active": @(MSGChatFolders_assignModeActive)}];
+        postNotificationName:MSGChatFoldersShowPickerNotification
+                      object:nil];
 }
 
 - (void)tabLongPressed:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     UIButton *btn = (UIButton *)gesture.view;
     NSInteger idx = btn.tag - kTagBase;
-    if (idx == 0) return;  // Don't allow long-press on "All"
+    if (idx == 0) return;
 
     NSString *folderId = btn.accessibilityIdentifier;
     if (folderId && [self.delegate respondsToSelector:@selector(folderTabView:didLongPressFolderId:)]) {
