@@ -29,6 +29,9 @@ static const void *kFolderTabViewKey         = &kFolderTabViewKey;
 static const void *kFolderInitializedKey     = &kFolderInitializedKey;
 static const void *kContextMenuHookedKey     = &kContextMenuHookedKey;
 static const void *kCollectionViewRefKey     = &kCollectionViewRefKey;
+static const void *kAssignTapGestureKey      = &kAssignTapGestureKey;
+static const void *kAssignOverlayKey         = &kAssignOverlayKey;
+static const void *kInboxVCRefKey            = &kInboxVCRefKey;
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Forward Declarations
@@ -707,6 +710,198 @@ static void hookDelegateOnCollectionView(UICollectionView *cv) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// MARK: - Assign Mode Overlay (Tap Interception)
+// ═══════════════════════════════════════════════════════════
+
+/// A clear overlay placed on top of the collection view during assign mode.
+/// It captures taps (to show folder assignment) but passes through scroll gestures.
+@interface MSGChatFolderAssignOverlay : UIView <UIGestureRecognizerDelegate>
+@property (nonatomic, weak) UICollectionView *targetCollectionView;
+@end
+
+@implementation MSGChatFolderAssignOverlay
+
+- (instancetype)initWithFrame:(CGRect)frame collectionView:(UICollectionView *)cv {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.targetCollectionView = cv;
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.01]; // Nearly invisible
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
+        // Tap gesture — this is what intercepts conversation taps
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+            initWithTarget:self action:@selector(handleAssignTap:)];
+        tap.delegate = self;
+        [self addGestureRecognizer:tap];
+
+        // Pan gesture — forward scrolling to the collection view beneath
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:self action:@selector(handlePan:)];
+        pan.delegate = self;
+        [self addGestureRecognizer:pan];
+    }
+    return self;
+}
+
+- (void)handleAssignTap:(UITapGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateEnded) return;
+
+    UICollectionView *cv = self.targetCollectionView;
+    if (!cv) return;
+
+    // Convert tap point to collection view coordinates
+    CGPoint point = [gesture locationInView:cv];
+    NSIndexPath *indexPath = [cv indexPathForItemAtPoint:point];
+
+    if (!indexPath) {
+        NSLog(@"[MSGChatFolders] Assign tap: no cell at tapped point");
+        return;
+    }
+
+    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
+    if (!cell) return;
+
+    NSString *threadKey = extractThreadKeyFromCell(cell);
+    NSLog(@"[MSGChatFolders] Assign tap: indexPath=%@, threadKey=%@", indexPath, threadKey);
+
+    if (threadKey) {
+        UIViewController *topVC = findTopViewController();
+        if (topVC) {
+            presentFolderActionSheet(topVC, threadKey);
+        }
+    } else {
+        UIViewController *topVC = findTopViewController();
+        if (topVC) {
+            // Log cell class info for debugging
+            NSLog(@"[MSGChatFolders] Cell class: %@", NSStringFromClass([cell class]));
+            unsigned int ivarCount = 0;
+            Ivar *ivars = class_copyIvarList([cell class], &ivarCount);
+            for (unsigned int i = 0; i < ivarCount; i++) {
+                NSLog(@"[MSGChatFolders]   ivar: %s (%s)",
+                      ivar_getName(ivars[i]), ivar_getTypeEncoding(ivars[i]));
+            }
+            if (ivars) free(ivars);
+
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Could not identify conversation"
+                                 message:@"The thread key could not be extracted from this cell. "
+                                          "Please check the device logs for [MSGChatFolders] entries."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:nil]];
+            [topVC presentViewController:alert animated:YES completion:nil];
+        }
+    }
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    // Forward scroll to the collection view beneath
+    UICollectionView *cv = self.targetCollectionView;
+    if (!cv) return;
+
+    CGPoint translation = [gesture translationInView:self];
+    CGPoint contentOffset = cv.contentOffset;
+    contentOffset.y -= translation.y;
+
+    // Clamp to content bounds
+    CGFloat maxOffset = cv.contentSize.height - cv.bounds.size.height + cv.contentInset.bottom;
+    CGFloat minOffset = -cv.contentInset.top;
+    contentOffset.y = MAX(minOffset, MIN(maxOffset, contentOffset.y));
+
+    cv.contentOffset = contentOffset;
+    [gesture setTranslation:CGPointZero inView:self];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return NO;
+}
+
+@end
+
+// ── Assign mode toggle handler ──
+
+static void MSGChatFolders_handleAssignModeChanged(NSNotification *note) {
+    BOOL active = [note.userInfo[@"active"] boolValue];
+    NSLog(@"[MSGChatFolders] Assign mode notification: %@", active ? @"ON" : @"OFF");
+
+    // Find the stored collection view and inbox VC
+    // We search through all windows to find our tab view and its sibling collection view
+    UIWindow *window = nil;
+    if (@available(iOS 15.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow) { window = w; break; }
+                }
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (!window) window = [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
+
+    if (!window) return;
+
+    // Find our tab view in the view hierarchy
+    UIView *rootView = window.rootViewController.view;
+    MSGChatFolderTabView *tabView = nil;
+    UICollectionView *cv = nil;
+
+    // BFS search for tab view and collection view
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:rootView];
+    while (queue.count > 0) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+
+        if ([v isKindOfClass:[MSGChatFolderTabView class]]) {
+            tabView = (MSGChatFolderTabView *)v;
+        }
+        // Look for collection views that are siblings of the tab view
+        if ([v isKindOfClass:[UICollectionView class]] && !cv) {
+            cv = (UICollectionView *)v;
+        }
+
+        [queue addObjectsFromArray:v.subviews];
+    }
+
+    if (!cv) {
+        NSLog(@"[MSGChatFolders] Assign mode: no collection view found!");
+        return;
+    }
+
+    static const NSInteger kOverlayTag = 98765;
+
+    if (active) {
+        // Check if overlay already exists
+        UIView *existing = [cv.superview viewWithTag:kOverlayTag];
+        if (existing) {
+            NSLog(@"[MSGChatFolders] Assign overlay already exists");
+            return;
+        }
+
+        // Create overlay on top of the collection view
+        MSGChatFolderAssignOverlay *overlay = [[MSGChatFolderAssignOverlay alloc]
+            initWithFrame:cv.frame collectionView:cv];
+        overlay.tag = kOverlayTag;
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [cv.superview insertSubview:overlay aboveSubview:cv];
+
+        NSLog(@"[MSGChatFolders] ✅ Assign overlay added on top of collection view");
+    } else {
+        // Remove overlay
+        UIView *overlay = [cv.superview viewWithTag:kOverlayTag];
+        if (overlay) {
+            [overlay removeFromSuperview];
+            NSLog(@"[MSGChatFolders] ✅ Assign overlay removed");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // MARK: - Folder Tab Delegate Handling
 // ═══════════════════════════════════════════════════════════
 
@@ -1025,6 +1220,16 @@ void MSGChatFolders_RegisterHooks(void) {
         CFLOG(@"WARNING: No inbox view controller class found!");
         CFLOG(@"Check the reconnaissance log above for available classes.");
     }
+
+    // Register assign mode overlay handler
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:MSGChatFoldersAssignModeChangedNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        MSGChatFolders_handleAssignModeChanged(note);
+    }];
+    CFLOG(@"Registered assign mode notification observer");
 
     CFLOG(@"Hook registration complete.");
 }
