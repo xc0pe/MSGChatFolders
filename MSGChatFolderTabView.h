@@ -3,7 +3,7 @@
 //  MSGChatFolders — Messenger Chat Folders Tweak
 //
 //  Horizontal scrollable tab bar showing folder names.
-//  "All" is always first, "+" (create) and "📂" (assign) buttons at the end.
+//  "All" is always first, "+" (create) and "📂" (pick) buttons at the end.
 //
 
 #import <UIKit/UIKit.h>
@@ -16,11 +16,8 @@
 - (void)folderTabView:(MSGChatFolderTabView *)tabView didLongPressFolderId:(NSString *)folderId;
 @end
 
-/// Global flag: when YES, tapping a conversation shows folder assignment instead of opening chat
-extern BOOL MSGChatFolders_assignModeActive;
-
-/// Notification posted when assign mode changes
-extern NSString *const MSGChatFoldersAssignModeChangedNotification;
+/// Notification posted when user taps the 📂 button to pick conversations
+extern NSString *const MSGChatFoldersShowPickerNotification;
 
 @interface MSGChatFolderTabView : UIView
 
