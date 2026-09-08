@@ -61,13 +61,16 @@ static UIViewController *MSGChatFolders_topViewController(void) {
     return vc;
 }
 
-/// Recursively finds and reloads all collection views in the hierarchy.
-static void MSGChatFolders_reloadCollectionViews(UIView *view) {
+/// Recursively finds and reloads all table views and collection views in the hierarchy.
+static void MSGChatFolders_reloadAllViews(UIView *view) {
+    if ([view isKindOfClass:[UITableView class]]) {
+        [(UITableView *)view reloadData];
+    }
     if ([view isKindOfClass:[UICollectionView class]]) {
         [(UICollectionView *)view reloadData];
     }
     for (UIView *sub in view.subviews) {
-        MSGChatFolders_reloadCollectionViews(sub);
+        MSGChatFolders_reloadAllViews(sub);
     }
 }
 
@@ -164,7 +167,7 @@ static void setupInboxNotificationObservers(void) {
         UIWindow *window = MSGChatFolders_keyWindow();
         if (window) {
             UIViewController *rootVC = window.rootViewController;
-            MSGChatFolders_reloadCollectionViews(rootVC.view);
+            MSGChatFolders_reloadAllViews(rootVC.view);
         }
     }];
 
