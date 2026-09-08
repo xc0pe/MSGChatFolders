@@ -34,6 +34,22 @@ static const NSInteger kTagBase       = 7000;
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
+        if (@available(iOS 13.0, *)) {
+            self.backgroundColor = [UIColor systemBackgroundColor];
+        } else {
+            self.backgroundColor = [UIColor whiteColor];
+        }
+
+        // Native bottom hairline separator
+        UIView *hairline = [[UIView alloc] initWithFrame:CGRectMake(0, frame.size.height - 0.5, frame.size.width, 0.5)];
+        hairline.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+        if (@available(iOS 13.0, *)) {
+            hairline.backgroundColor = [UIColor separatorColor];
+        } else {
+            hairline.backgroundColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+        }
+        [self addSubview:hairline];
+
         [self setupUI];
         _selectedFolderId = @"all";
 
