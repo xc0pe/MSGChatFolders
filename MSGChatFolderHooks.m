@@ -5,9 +5,9 @@
 //  Universal hooks supporting BOTH UITableView and UICollectionView.
 //  1. Long-press on any chat -> "📁 Add to Folder"
 //  2. Swipe-left on any chat -> "📁 Folder" button
-//  3. Top folder tab bar -> Instant filtering
-//  4. "📂" button -> Conversation picker (filters out active users by row width >= 240pt)
-//  5. Fallback naming identifier if internal threadKey is obscured
+//  3. Top folder tab bar -> Locked smoothly below nav bar, no jumping
+//  4. "📂" button -> Conversation picker (active users excluded by width >= 240pt)
+//  5. In-chat safety guard -> NEVER filters or touches message bubbles, photos, or media
 //
 
 #import <objc/runtime.h>
@@ -19,7 +19,6 @@
 #define CFLOG(fmt, ...) NSLog(@"[MSGChatFolders] " fmt, ##__VA_ARGS__)
 
 static const void *kFolderTabViewKey       = &kFolderTabViewKey;
-static const void *kFolderInitializedKey   = &kFolderInitializedKey;
 static const void *kDelegateHookedKey      = &kDelegateHookedKey;
 static const void *kCellThreadKeyKey       = &kCellThreadKeyKey;
 static const void *kCellTitleKey           = &kCellTitleKey;
@@ -29,6 +28,7 @@ static const void *kCellGestureAttachedKey = &kCellGestureAttachedKey;
 // MARK: - Forward Declarations
 // ═══════════════════════════════════════════════════════════
 
+static BOOL isInboxViewController(id controller);
 static NSString *extractThreadKeyFromObject(id obj);
 static NSString *extractTitleFromCell(UIView *cell);
 static NSString *getBestIdentifierForCell(UIView *cell, NSString **outTitle);
@@ -36,6 +36,7 @@ static void presentFolderActionSheet(UIViewController *presenter, NSString *thre
 static UIViewController *findTopViewController(void);
 static UIWindow *findAppWindow(void);
 static void hookScrollDelegate(id delegate);
+static void layoutFolderTabBarInVC(UIViewController *vc);
 
 static void msgcf_folderTabDidSelect(id self, SEL _cmd, NSNotification *note);
 static void msgcf_folderTabDidCreate(id self, SEL _cmd, NSNotification *note);
@@ -46,7 +47,7 @@ static void msgcf_folderTabDidLongPress(id self, SEL _cmd, NSNotification *note)
 // ═══════════════════════════════════════════════════════════
 
 static void (*orig_inboxViewDidAppear)(id self, SEL _cmd, BOOL animated);
-static void (*orig_threadListViewDidAppear)(id self, SEL _cmd, BOOL animated);
+static void (*orig_inboxViewDidLayoutSubviews)(id self, SEL _cmd);
 
 // UITableView delegate IMPs
 static UIContextMenuConfiguration *(*orig_tvContextMenu)(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip, CGPoint point);
@@ -58,9 +59,36 @@ static void (*orig_tvWillDisplayCell)(id self, SEL _cmd, UITableView *tv, UITabl
 static UIContextMenuConfiguration *(*orig_cvContextMenu)(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *ip, CGPoint point);
 static void (*orig_cvWillDisplayCell)(id self, SEL _cmd, UICollectionView *cv, UICollectionViewCell *cell, NSIndexPath *ip);
 
-// Cell model setter IMPs
-static void (*orig_setRowModel)(id self, SEL _cmd, id rowModel, id mailbox, id mediaManager, id threadPresenceObserver, BOOL isForPrototypeCell, BOOL forceRefresh, BOOL isBulkEditing, BOOL shouldAnnounceNewMessage);
-static void (*orig_setModel)(id self, SEL _cmd, id model, BOOL isForPrototypeCell, BOOL forceRefresh, BOOL isBulkEditing, BOOL shouldAnnounceNewMessage);
+// ═══════════════════════════════════════════════════════════
+// MARK: - Inbox Safety Guard
+// ═══════════════════════════════════════════════════════════
+
+/// Checks if the controller is strictly an inbox/conversation list controller.
+/// Returns NO for any inside-chat screens (MSGMessageListViewController, media viewers, etc.)
+static BOOL isInboxViewController(id controller) {
+    if (!controller) return NO;
+    NSString *cls = NSStringFromClass([controller class]);
+
+    // Explicitly reject any inside-conversation view controllers
+    if ([cls containsString:@"Message"] ||
+        [cls containsString:@"Conversation"] ||
+        [cls containsString:@"ThreadView"] ||
+        [cls containsString:@"ChatView"] ||
+        [cls containsString:@"MediaViewer"] ||
+        [cls containsString:@"Photo"] ||
+        [cls containsString:@"Story"]) {
+        return NO;
+    }
+
+    // Explicitly accept inbox controllers
+    if ([cls containsString:@"Inbox"] ||
+        [cls containsString:@"ThreadList"] ||
+        [cls containsString:@"LSTable"]) {
+        return YES;
+    }
+
+    return NO;
+}
 
 // ═══════════════════════════════════════════════════════════
 // MARK: - Window & View Hierarchy
@@ -246,7 +274,6 @@ static NSString *extractThreadKeyFromObject(id obj) {
     return nil;
 }
 
-/// Returns the best identifier for a cell: uses threadKey if found, or sanitized title as fallback
 static NSString *getBestIdentifierForCell(UIView *cell, NSString **outTitle) {
     NSString *title = extractTitleFromCell(cell);
     if (outTitle) *outTitle = title;
@@ -254,7 +281,7 @@ static NSString *getBestIdentifierForCell(UIView *cell, NSString **outTitle) {
     NSString *key = extractThreadKeyFromObject(cell);
     if (key.length > 0) return key;
 
-    // Fail-safe: Use contact name as stable identifier
+    // Fail-safe: Use sanitized contact name as stable identifier
     if (title.length > 0) {
         return [NSString stringWithFormat:@"chat_%@", title];
     }
@@ -262,7 +289,7 @@ static NSString *getBestIdentifierForCell(UIView *cell, NSString **outTitle) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - Folder Action Sheet & Menu
+// MARK: - Reload All Chat Views
 // ═══════════════════════════════════════════════════════════
 
 static void reloadAllChatViews(void) {
@@ -276,12 +303,18 @@ static void reloadAllChatViews(void) {
             if ([v isKindOfClass:[UITableView class]]) {
                 [(UITableView *)v reloadData];
             } else if ([v isKindOfClass:[UICollectionView class]]) {
-                [(UICollectionView *)v reloadData];
+                if (![v.superview isKindOfClass:[MSGChatFolderTabView class]]) {
+                    [(UICollectionView *)v reloadData];
+                }
             }
             [queue addObjectsFromArray:v.subviews];
         }
     });
 }
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Folder Action Sheet & Menu
+// ═══════════════════════════════════════════════════════════
 
 static void presentFolderActionSheet(UIViewController *presenter, NSString *threadKey, NSString *chatTitle) {
     if (!threadKey || !presenter) return;
@@ -443,7 +476,7 @@ static void handleCellLongPressGesture(UILongPressGestureRecognizer *gesture) {
 
 static void attachGestureToCellIfNeeded(UIView *cell) {
     if (!cell) return;
-    // Only attach to wide conversation rows (width >= 240)
+    // Strictly conversation rows (width >= 240)
     if (cell.bounds.size.width < 240) return;
 
     NSNumber *attached = objc_getAssociatedObject(cell, kCellGestureAttachedKey);
@@ -454,7 +487,6 @@ static void attachGestureToCellIfNeeded(UIView *cell) {
         initWithTarget:cell action:@selector(msgcf_handleLongPress:)];
     lp.minimumPressDuration = 0.45;
 
-    // Add selector dynamically to cell class
     class_addMethod([cell class], NSSelectorFromString(@"msgcf_handleLongPress:"),
                     (IMP)handleCellLongPressGesture, "v@:@");
     [cell addGestureRecognizer:lp];
@@ -465,6 +497,11 @@ static void attachGestureToCellIfNeeded(UIView *cell) {
 // ═══════════════════════════════════════════════════════════
 
 static UIContextMenuConfiguration *hooked_tvContextMenu(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath, CGPoint point) {
+    // Safety guard: only execute in inbox!
+    if (!isInboxViewController(self)) {
+        return orig_tvContextMenu ? orig_tvContextMenu(self, _cmd, tableView, indexPath, point) : nil;
+    }
+
     UIContextMenuConfiguration *orig = orig_tvContextMenu ? orig_tvContextMenu(self, _cmd, tableView, indexPath, point) : nil;
 
     UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
@@ -499,10 +536,14 @@ static UIContextMenuConfiguration *hooked_tvContextMenu(id self, SEL _cmd, UITab
 }
 
 static UIContextMenuConfiguration *hooked_cvContextMenu(id self, SEL _cmd, UICollectionView *collectionView, NSIndexPath *indexPath, CGPoint point) {
+    // Safety guard: only execute in inbox!
+    if (!isInboxViewController(self)) {
+        return orig_cvContextMenu ? orig_cvContextMenu(self, _cmd, collectionView, indexPath, point) : nil;
+    }
+
     UIContextMenuConfiguration *orig = orig_cvContextMenu ? orig_cvContextMenu(self, _cmd, collectionView, indexPath, point) : nil;
 
     UICollectionViewCell *cell = [collectionView cellForItemAtIndexPath:indexPath];
-    // Exclude narrow profile circles
     if (cell && cell.bounds.size.width < 240) return orig;
 
     NSString *title = nil;
@@ -536,6 +577,10 @@ static UIContextMenuConfiguration *hooked_cvContextMenu(id self, SEL _cmd, UICol
 }
 
 static UISwipeActionsConfiguration *hooked_tvTrailingSwipe(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
+    if (!isInboxViewController(self)) {
+        return orig_tvTrailingSwipe ? orig_tvTrailingSwipe(self, _cmd, tableView, indexPath) : nil;
+    }
+
     UISwipeActionsConfiguration *orig = orig_tvTrailingSwipe ? orig_tvTrailingSwipe(self, _cmd, tableView, indexPath) : nil;
 
     UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
@@ -561,6 +606,11 @@ static UISwipeActionsConfiguration *hooked_tvTrailingSwipe(id self, SEL _cmd, UI
 }
 
 static CGFloat hooked_tvHeightForRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
+    // Safety guard: if not in inbox, always return original height!
+    if (!isInboxViewController(self)) {
+        return orig_tvHeightForRow ? orig_tvHeightForRow(self, _cmd, tableView, indexPath) : UITableViewAutomaticDimension;
+    }
+
     NSString *selFolder = [MSGChatFolderManager sharedManager].selectedFolderId;
     if (!selFolder || [selFolder isEqualToString:@"all"]) {
         return orig_tvHeightForRow ? orig_tvHeightForRow(self, _cmd, tableView, indexPath) : UITableViewAutomaticDimension;
@@ -581,6 +631,13 @@ static CGFloat hooked_tvHeightForRow(id self, SEL _cmd, UITableView *tableView, 
 
 static void hooked_tvWillDisplayCell(id self, SEL _cmd, UITableView *tableView, UITableViewCell *cell, NSIndexPath *indexPath) {
     if (orig_tvWillDisplayCell) orig_tvWillDisplayCell(self, _cmd, tableView, cell, indexPath);
+
+    // Safety guard: if inside a conversation (messages/photos), NEVER hide cells!
+    if (!isInboxViewController(self)) {
+        cell.hidden = NO;
+        return;
+    }
+
     attachGestureToCellIfNeeded(cell);
 
     NSString *selFolder = [MSGChatFolderManager sharedManager].selectedFolderId;
@@ -600,9 +657,15 @@ static void hooked_tvWillDisplayCell(id self, SEL _cmd, UITableView *tableView, 
 
 static void hooked_cvWillDisplayCell(id self, SEL _cmd, UICollectionView *collectionView, UICollectionViewCell *cell, NSIndexPath *indexPath) {
     if (orig_cvWillDisplayCell) orig_cvWillDisplayCell(self, _cmd, collectionView, cell, indexPath);
+
+    // Safety guard: if inside a conversation (messages/photos), NEVER hide cells!
+    if (!isInboxViewController(self)) {
+        cell.hidden = NO;
+        return;
+    }
+
     attachGestureToCellIfNeeded(cell);
 
-    // Only filter wide conversation cells
     if (cell.bounds.size.width >= 240) {
         NSString *selFolder = [MSGChatFolderManager sharedManager].selectedFolderId;
         if (selFolder && ![selFolder isEqualToString:@"all"]) {
@@ -631,8 +694,6 @@ static void hookScrollDelegate(id delegate) {
     NSNumber *hooked = objc_getAssociatedObject(cls, kDelegateHookedKey);
     if ([hooked boolValue]) return;
     objc_setAssociatedObject(cls, kDelegateHookedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    CFLOG(@"Hooking scroll delegate on %@", NSStringFromClass(cls));
 
     // UITableView hooks
     SEL tvCtxSel = @selector(tableView:contextMenuConfigurationForRowAtIndexPath:point:);
@@ -703,7 +764,7 @@ static void MSGChatFolders_showConversationPicker(void) {
 
     NSMutableArray<UIView *> *allVisibleCells = [NSMutableArray array];
 
-    // Search ALL scroll views (both UITableView and UICollectionView)
+    // Search ALL scroll views in window
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:window.rootViewController.view];
     while (queue.count > 0) {
         UIView *v = queue.firstObject;
@@ -713,19 +774,17 @@ static void MSGChatFolders_showConversationPicker(void) {
             UITableView *tv = (UITableView *)v;
             hookScrollDelegate(tv.delegate);
             for (UITableViewCell *c in tv.visibleCells) {
-                // CRITICAL: Filter out profile circles / headers / active tray!
-                // Conversation rows MUST be wide (>= 240pt) and tall (>= 40pt)
+                // Must be full-width conversation row (>= 240pt)
                 if (c.bounds.size.width >= 240 && c.bounds.size.height >= 40) {
                     [allVisibleCells addObject:c];
                 }
             }
         } else if ([v isKindOfClass:[UICollectionView class]]) {
             UICollectionView *cv = (UICollectionView *)v;
-            // Ignore our own tab bar
             if (![cv.superview isKindOfClass:[MSGChatFolderTabView class]]) {
                 hookScrollDelegate(cv.delegate);
                 for (UICollectionViewCell *c in cv.visibleCells) {
-                    // CRITICAL: Exclude Active Now profile circles (width < 240pt)!
+                    // Must be full-width conversation row (>= 240pt)
                     if (c.bounds.size.width >= 240 && c.bounds.size.height >= 40) {
                         [allVisibleCells addObject:c];
                     }
@@ -734,8 +793,6 @@ static void MSGChatFolders_showConversationPicker(void) {
         }
         [queue addObjectsFromArray:v.subviews];
     }
-
-    CFLOG(@"Found %lu conversation rows (width >= 240pt)", (unsigned long)allVisibleCells.count);
 
     NSMutableArray<NSDictionary *> *conversations = [NSMutableArray array];
     for (UIView *cell in allVisibleCells) {
@@ -796,7 +853,88 @@ static void MSGChatFolders_showConversationPicker(void) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// MARK: - Tab Bar Injection & View Handling
+// MARK: - Rock-Solid Tab Bar Layout (No Jumping)
+// ═══════════════════════════════════════════════════════════
+
+static void layoutFolderTabBarInVC(UIViewController *vc) {
+    if (!vc || !vc.view) return;
+
+    // Only inject on the top-most inbox view controller
+    if (![vc isKindOfClass:NSClassFromString(@"MSGInboxViewController")]) {
+        return;
+    }
+
+    MSGChatFolderTabView *tabView = objc_getAssociatedObject(vc, kFolderTabViewKey);
+    CGFloat tabHeight = [MSGChatFolderTabView preferredHeight];
+
+    CGFloat safeTop = 0;
+    if (vc.navigationController && vc.navigationController.navigationBar && !vc.navigationController.navigationBarHidden) {
+        CGRect nbFrame = [vc.view convertRect:vc.navigationController.navigationBar.bounds fromView:vc.navigationController.navigationBar];
+        safeTop = CGRectGetMaxY(nbFrame);
+    }
+    if (safeTop <= 0 && @available(iOS 11.0, *)) {
+        safeTop = vc.view.safeAreaInsets.top;
+    }
+    if (safeTop <= 0) {
+        safeTop = 94.0; // Modern safe default below status + nav bar
+    }
+
+    if (!tabView) {
+        tabView = [[MSGChatFolderTabView alloc]
+            initWithFrame:CGRectMake(0, safeTop, vc.view.bounds.size.width, tabHeight)];
+        tabView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        tabView.selectedFolderId = [MSGChatFolderManager sharedManager].selectedFolderId;
+
+        objc_setAssociatedObject(vc, kFolderTabViewKey, tabView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [vc.view addSubview:tabView];
+        [tabView reloadTabs];
+    }
+
+    // Lock frame directly below the navigation bar
+    CGRect expectedFrame = CGRectMake(0, safeTop, vc.view.bounds.size.width, tabHeight);
+    if (!CGRectEqualToRect(tabView.frame, expectedFrame)) {
+        tabView.frame = expectedFrame;
+    }
+    [vc.view bringSubviewToFront:tabView];
+
+    // Ensure content scrolls behind the bar without being clipped (scans nested views)
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:vc.view];
+    while (queue.count > 0) {
+        UIView *sub = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (sub == tabView) continue;
+
+        if ([sub isKindOfClass:[UIScrollView class]]) {
+            UIScrollView *sv = (UIScrollView *)sub;
+            UIEdgeInsets insets = sv.contentInset;
+            if (insets.top < tabHeight) {
+                insets.top = tabHeight;
+                sv.contentInset = insets;
+                sv.scrollIndicatorInsets = insets;
+            }
+            if ([sub isKindOfClass:[UITableView class]]) {
+                hookScrollDelegate([(UITableView *)sub delegate]);
+            } else if ([sub isKindOfClass:[UICollectionView class]]) {
+                hookScrollDelegate([(UICollectionView *)sub delegate]);
+            }
+        } else {
+            [queue addObjectsFromArray:sub.subviews];
+        }
+    }
+}
+
+static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (orig_inboxViewDidAppear) orig_inboxViewDidAppear(self, _cmd, animated);
+    layoutFolderTabBarInVC((UIViewController *)self);
+}
+
+static void hooked_inboxViewDidLayoutSubviews(id self, SEL _cmd) {
+    if (orig_inboxViewDidLayoutSubviews) orig_inboxViewDidLayoutSubviews(self, _cmd);
+    layoutFolderTabBarInVC((UIViewController *)self);
+}
+
+// ═══════════════════════════════════════════════════════════
+// MARK: - Notifications from Tab Bar
 // ═══════════════════════════════════════════════════════════
 
 static void handleFolderTabLongPress(UIViewController *presenter, NSString *folderId) {
@@ -843,78 +981,6 @@ static void handleFolderTabLongPress(UIViewController *presenter, NSString *fold
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [presenter presentViewController:alert animated:YES completion:nil];
 }
-
-static void injectFolderTabBarIntoVC(UIViewController *vc) {
-    if (!vc || !vc.view) return;
-
-    NSNumber *initialized = objc_getAssociatedObject(vc, kFolderInitializedKey);
-    if ([initialized boolValue]) {
-        MSGChatFolderTabView *tabView = objc_getAssociatedObject(vc, kFolderTabViewKey);
-        [tabView reloadTabs];
-        return;
-    }
-    objc_setAssociatedObject(vc, kFolderInitializedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    CFLOG(@"Injecting folder tab bar into %@", NSStringFromClass([vc class]));
-
-    CGFloat tabHeight = [MSGChatFolderTabView preferredHeight];
-    MSGChatFolderTabView *tabView = [[MSGChatFolderTabView alloc]
-        initWithFrame:CGRectMake(0, 0, vc.view.bounds.size.width, tabHeight)];
-    tabView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    tabView.selectedFolderId = [MSGChatFolderManager sharedManager].selectedFolderId;
-
-    objc_setAssociatedObject(vc, kFolderTabViewKey, tabView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UIView *targetScroll = nil;
-    for (UIView *sub in vc.view.subviews) {
-        if ([sub isKindOfClass:[UITableView class]] || [sub isKindOfClass:[UICollectionView class]]) {
-            targetScroll = sub;
-            break;
-        }
-    }
-
-    if (targetScroll) {
-        CGRect sf = targetScroll.frame;
-        tabView.frame = CGRectMake(0, sf.origin.y, vc.view.bounds.size.width, tabHeight);
-        [vc.view addSubview:tabView];
-
-        sf.origin.y += tabHeight;
-        sf.size.height -= tabHeight;
-        targetScroll.frame = sf;
-    } else {
-        CGFloat safeTop = 0;
-        if (@available(iOS 11.0, *)) safeTop = vc.view.safeAreaInsets.top;
-        tabView.frame = CGRectMake(0, safeTop, vc.view.bounds.size.width, tabHeight);
-        [vc.view addSubview:tabView];
-    }
-
-    [tabView reloadTabs];
-
-    // Hook delegates on any scroll view found
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (targetScroll) {
-            if ([targetScroll isKindOfClass:[UITableView class]]) {
-                hookScrollDelegate([(UITableView *)targetScroll delegate]);
-            } else if ([targetScroll isKindOfClass:[UICollectionView class]]) {
-                hookScrollDelegate([(UICollectionView *)targetScroll delegate]);
-            }
-        }
-    });
-}
-
-static void hooked_inboxViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (orig_inboxViewDidAppear) orig_inboxViewDidAppear(self, _cmd, animated);
-    injectFolderTabBarIntoVC((UIViewController *)self);
-}
-
-static void hooked_threadListViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (orig_threadListViewDidAppear) orig_threadListViewDidAppear(self, _cmd, animated);
-    injectFolderTabBarIntoVC((UIViewController *)self);
-}
-
-// ═══════════════════════════════════════════════════════════
-// MARK: - Notifications from Tab Bar
-// ═══════════════════════════════════════════════════════════
 
 static void msgcf_folderTabDidSelect(id self, SEL _cmd, NSNotification *note) {
     NSString *folderId = note.userInfo[@"folderId"];
@@ -970,10 +1036,21 @@ static void addMethodIfMissing(Class cls, SEL sel, IMP imp, const char *types) {
 void MSGChatFolders_RegisterHooks(void) {
     CFLOG(@"Registering universal MSGChatFolders hooks...");
 
+    // Hook MSGInboxViewController (Single owner of the folder tab bar)
+    Class inboxClass = NSClassFromString(@"MSGInboxViewController");
+    if (inboxClass) {
+        swizzle(inboxClass, @selector(viewDidAppear:), (IMP)hooked_inboxViewDidAppear, (IMP *)&orig_inboxViewDidAppear);
+        swizzle(inboxClass, @selector(viewDidLayoutSubviews), (IMP)hooked_inboxViewDidLayoutSubviews, (IMP *)&orig_inboxViewDidLayoutSubviews);
+
+        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidSelect:"), (IMP)msgcf_folderTabDidSelect, "v@:@");
+        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidCreate:"), (IMP)msgcf_folderTabDidCreate, "v@:@");
+        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidLongPress:"), (IMP)msgcf_folderTabDidLongPress, "v@:@");
+        hookScrollDelegate((id)inboxClass);
+    }
+
     // Hook MSGThreadListViewController
     Class threadListClass = NSClassFromString(@"MSGThreadListViewController");
     if (threadListClass) {
-        swizzle(threadListClass, @selector(viewDidAppear:), (IMP)hooked_threadListViewDidAppear, (IMP *)&orig_threadListViewDidAppear);
         hookScrollDelegate((id)threadListClass);
     }
 
@@ -981,16 +1058,6 @@ void MSGChatFolders_RegisterHooks(void) {
     Class lsTableClass = NSClassFromString(@"LSTableViewController");
     if (lsTableClass) {
         hookScrollDelegate((id)lsTableClass);
-    }
-
-    // Hook MSGInboxViewController
-    Class inboxClass = NSClassFromString(@"MSGInboxViewController");
-    if (inboxClass) {
-        swizzle(inboxClass, @selector(viewDidAppear:), (IMP)hooked_inboxViewDidAppear, (IMP *)&orig_inboxViewDidAppear);
-        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidSelect:"), (IMP)msgcf_folderTabDidSelect, "v@:@");
-        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidCreate:"), (IMP)msgcf_folderTabDidCreate, "v@:@");
-        addMethodIfMissing(inboxClass, NSSelectorFromString(@"msgcf_folderTabDidLongPress:"), (IMP)msgcf_folderTabDidLongPress, "v@:@");
-        hookScrollDelegate((id)inboxClass);
     }
 
     // Register 📂 picker notification
