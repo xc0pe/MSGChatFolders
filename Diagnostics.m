@@ -5,8 +5,8 @@
 #import <mach-o/dyld.h>
 #import <string.h>
 
-// D1: observations only. No private getters, model writes, list mutations or networking.
-static NSString * const Build = @"D1-20260914";
+// D2: observations only. No private getters, model writes, list mutations or networking.
+static NSString * const Build = @"D2-20260914";
 static NSMutableDictionary *Report;
 static NSObject *ReportLock;
 static NSMutableSet *InspectedClasses;
@@ -14,7 +14,7 @@ static NSMutableSet *InstalledHooks;
 static NSMutableArray *HookChecks;
 static UIButton *ProbeButton;
 static BOOL Enabled;
-static BOOL RowSampleCaptured;
+static NSUInteger RowBatchesObserved;
 static NSUInteger ScanCount;
 static const NSUInteger MaxClasses = 80;
 
@@ -69,10 +69,15 @@ static void DescribeClass(Class cls) {
         free(fields);
         entry[@"ivars_metadata_only"] = ivars;
         Report[@"classes"][name] = entry;
+        Class parent = class_getSuperclass(cls);
+        if (parent && parent != NSObject.class && parent != NSProxy.class) DescribeClass(parent);
     }
 }
 
 static void ObserveRows(id rows) {
+    // Sample later updates too: D1 stopped at the first startup-only batch.
+    if (RowBatchesObserved >= 256) return;
+    RowBatchesObserved++;
     if (![rows isKindOfClass:[NSArray class]]) {
         @synchronized (ReportLock) { Report[@"row_argument_class"] = ClassName(rows); }
         DescribeClass(object_getClass(rows));
@@ -81,14 +86,21 @@ static void ObserveRows(id rows) {
     NSArray *items = rows;
     NSMutableSet *names = [NSMutableSet set];
     // No element getters or values are read. Class metadata only.
-    for (NSUInteger i = 0; i < MIN(items.count, 32u) && names.count < 5; i++) {
+    for (NSUInteger i = 0; i < MIN(items.count, 128u); i++) {
         id item = items[i];
         [names addObject:ClassName(item)];
         DescribeClass(object_getClass(item));
     }
     @synchronized (ReportLock) {
-        Report[@"last_row_batch"] = @{@"count": @(items.count), @"sample_classes": [[names allObjects] sortedArrayUsingSelector:@selector(compare:)]};
-        RowSampleCaptured = items.count > 0;
+        NSDictionary *batch = @{@"count": @(items.count), @"sample_classes": [[names allObjects] sortedArrayUsingSelector:@selector(compare:)], @"sampled_items": @(MIN(items.count, 128u))};
+        Report[@"last_row_batch"] = batch;
+        Report[@"row_batches_observed"] = @(RowBatchesObserved);
+        Report[@"max_row_count"] = @(MAX([Report[@"max_row_count"] unsignedIntegerValue], items.count));
+        NSMutableArray *history = Report[@"row_batch_history"];
+        if (![history.lastObject isEqual:batch]) {
+            if (history.count >= 20) [history removeObjectAtIndex:0];
+            [history addObject:batch];
+        }
     }
 }
 
@@ -156,7 +168,7 @@ static void InstallRows(Class cls) {
         {
             Count(key);
             @synchronized (ReportLock) {
-                if (!RowSampleCaptured) ObserveRows(rows);
+                ObserveRows(rows);
             }
         }
         ((void (*)(id, SEL, id, id, id, id, id))original)(receiver, sel, rows, connection, ranges, update, completion);
@@ -176,13 +188,33 @@ static void InstallRowGetter(Class cls) {
     IMP replacement = imp_implementationWithBlock(^id(id receiver) {
         id rows = ((id (*)(id, SEL))original)(receiver, sel);
         Count(key);
-        @synchronized (ReportLock) { if (!RowSampleCaptured) ObserveRows(rows); }
+        @synchronized (ReportLock) { ObserveRows(rows); }
         return rows;
     });
     Replace(cls, sel, method, replacement, key);
 }
 
+static void InstallAdapterProbe(void) {
+    Class cls = NSClassFromString(@"MSGInboxRowAdapter");
+    if (!cls) return;
+    DescribeClass(cls);
+    NSString *key = @"MSGInboxRowAdapter.threadKey";
+    if ([InstalledHooks containsObject:key]) return;
+    SEL sel = NSSelectorFromString(@"threadKey");
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!Matches(method, 'q', "")) { Status(key, @"missing or signature mismatch; skipped"); return; }
+    IMP original = method_getImplementation(method);
+    @synchronized (ReportLock) { Report[@"original_implementation_images"][key] = ImageForIMP(original); }
+    IMP replacement = imp_implementationWithBlock(^long long(id receiver) {
+        Count(key);
+        // Return the original value without storing or exporting it.
+        return ((long long (*)(id, SEL))original)(receiver, sel);
+    });
+    Replace(cls, sel, method, replacement, key);
+}
+
 static void InstallHooks(void) {
+    InstallAdapterProbe();
     for (NSString *name in @[@"MSGThreadListViewController", @"MSGInboxFoldersViewController",
                              @"_TtC15LightSpeedInbox22MSGInboxViewController"]) {
         Class cls = NSClassFromString(name);
@@ -277,7 +309,7 @@ static NSString *ReportText(void) {
 @implementation MCFDReportController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Folders diagnostics · D1";
+    self.title = @"Folders diagnostics · D2";
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UITextView *text = [[UITextView alloc] initWithFrame:CGRectZero];
     text.translatesAutoresizingMaskIntoConstraints = NO;
@@ -294,7 +326,7 @@ static NSString *ReportText(void) {
 }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 - (void)share {
-    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"MSGChatFolders-D1.json"]];
+    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"MSGChatFolders-D2.json"]];
     NSError *error = nil;
     if (![ReportText() writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Could not create report" message:@"Close this screen and try again." preferredStyle:UIAlertControllerStyleAlert];
@@ -328,12 +360,12 @@ static void Tick(void) {
     if (!window) return;
     if (!ProbeButton) {
         ProbeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        [ProbeButton setTitle:@"Folders · D1" forState:UIControlStateNormal];
+        [ProbeButton setTitle:@"Folders · D2" forState:UIControlStateNormal];
         [ProbeButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         ProbeButton.backgroundColor = UIColor.systemIndigoColor;
         ProbeButton.layer.cornerRadius = 17;
         ProbeButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-        ProbeButton.accessibilityLabel = @"Open folder diagnostics. Plugin loaded, build D1.";
+        ProbeButton.accessibilityLabel = @"Open folder diagnostics. Plugin loaded, build D2.";
         [ProbeButton addTarget:MCFDLauncher.class action:@selector(show) forControlEvents:UIControlEventTouchUpInside];
     }
     if (ProbeButton.superview != window) [window addSubview:ProbeButton];
@@ -353,6 +385,7 @@ __attribute__((constructor)) static void Start(void) {
                     @"privacy": @"No chat text, titles, account/thread identifiers, ivar values, or object descriptions collected",
                     @"hooks": [NSMutableDictionary dictionary], @"calls": [NSMutableDictionary dictionary],
                     @"classes": [NSMutableDictionary dictionary], @"ui_samples": [NSMutableArray array],
+                    @"row_batch_history": [NSMutableArray array],
                     @"original_implementation_images": [NSMutableDictionary dictionary]} mutableCopy];
         NSLog(@"[MSGChatFoldersDiagnostics] %@ constructor reached", Build);
         dispatch_async(dispatch_get_main_queue(), ^{
