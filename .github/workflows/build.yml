@@ -1,4 +1,4 @@
-name: Build folder diagnostics D1
+name: Build folder diagnostics D2
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
         run: make all
       - uses: actions/upload-artifact@v4
         with:
-          name: MSGChatFoldersDiagnostics-D1
+          name: MSGChatFoldersDiagnostics-D2
           path: |
             build/MSGChatFoldersDiagnostics.dylib
             build/SHA256SUMS.txt
