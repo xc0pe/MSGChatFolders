@@ -1,4 +1,4 @@
-name: Build folders prototype F1
+name: Build folders prototype F2
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
         run: make all
       - uses: actions/upload-artifact@v4
         with:
-          name: MSGChatFolders-F1
+          name: MSGChatFolders-F2
           path: |
             build/MSGChatFoldersPrototype.dylib
             build/SHA256SUMS.txt
