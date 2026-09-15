@@ -1,10 +1,12 @@
-name: Build folder diagnostics D2
+name: Build folders prototype F1
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'Diagnostics.m'
+      - 'Prototype.m'
+      - 'Filter.h'
+      - 'FilterTests.m'
       - 'Makefile'
       - '.github/workflows/build.yml'
 
@@ -17,13 +19,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Check filter behavior
+        run: make test
       - name: Compile and verify arm64 dylib
         run: make all
       - uses: actions/upload-artifact@v4
         with:
-          name: MSGChatFoldersDiagnostics-D2
+          name: MSGChatFolders-F1
           path: |
-            build/MSGChatFoldersDiagnostics.dylib
+            build/MSGChatFoldersPrototype.dylib
             build/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
