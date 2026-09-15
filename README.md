@@ -1,27 +1,24 @@
-# Chat folders F1 — functional prototype
+# Chat folders F2
 
-Targets the supplied Messenger 571.0.0 installation with one account. This build supports creating folders, manually assigning currently loaded chats, deleting folders, and selecting a folder to filter Messenger's native list. Membership persists locally across restarts. The app starts in All chats.
+Adds folder renaming and an experimental Folder action to Messenger's native left-swipe menu. F1 filtering and the existing single-account storage key are retained.
 
-## Install and try
+## Install and test
 
-1. Use the original supplied IPA, keeping MSGPlusX and its original sideloading patches. Remove the D1/D2 diagnostic library and any old folder tweak from your injection selection.
-2. Inject only `MSGChatFoldersPrototype.dylib` as the new folder tweak, then sign/install with ESign as before.
-3. Once chats load, tap **Folders · F1**. Tap **+** to create a folder. Tap its **ⓘ** button and select two or three recognizable chats. Go back and tap the folder's name to apply it.
-4. Check that those chats appear consecutively and each opens the correct conversation. Use **All chats** to restore the full list. Test receiving a message and restarting Messenger; membership should remain saved.
-5. If selection has no effect, rows are missing, or controls say they are waiting for models, share `MSGChatFolders-F1.json` using the share button in the folder screen. The report contains counts, class names and status, not chat names, identifiers or folder names.
+Replace the F1 folder library with this build of MSGChatFoldersPrototype.dylib in ESign, keeping the original MSGPlusX and sideload patches. Do not inject both versions. Install over the same app to retain its local data.
 
-The picker shows only chats Messenger has loaded. To assign older chats, select All chats, scroll further in Messenger, then reopen the picker. This is not an account-wide database query.
+- In Folders F2, swipe a folder and choose Rename, or open its info button and tap Rename. Membership and selection use the unchanged folder ID. Blank names are ignored.
+- Swipe a conversation left. If Folder appears alongside the native actions, tap it. Confirm the picker title matches the swiped chat, then toggle its folders. Done returns to Messenger and refreshes the filter.
+- Check two different chats in All chats and in a filtered folder. Check the native actions still work. Restart and check names and assignments persist.
+- If Folder is absent or incorrect, export MSGChatFolders-F2.json from the folder screen after attempting a swipe. Counts and status only; no conversation or folder names/identifiers are exported.
 
-## Limits
+## Integration limits
 
-This is the first functional prototype and requires phone validation. Native long-press assignment, a permanent tab strip, rename/reordering, account switching, and comprehensive pagination testing are not implemented yet. The temporary F1 button uses the same upper-right location as diagnostics.
+Swipe identity capture is scoped to the observed inbox binder and table while its original trailing-swipe method executes. It accepts exactly one thread key read through MSGInboxRowAdapter, matching an already decoded chat. It never guesses a chat from the row number. If Messenger does not read an unambiguous identity during menu construction, the original menu is returned unchanged. This integration needs phone validation.
 
-Filtering is scoped to the observed inbox data-source instance and runs on the main thread. It returns an ordered subset of the original row objects to Messenger's renderer; it never hides cells or changes row heights. Unknown conversation identities disable filtering rather than dropping those chats. It does not modify Messenger's database or send network requests.
+Native actions, their order, and their full-swipe setting are retained; Folder is appended. Folder assignments save immediately and support multiple folders. Creating a folder in the picker requires tapping it to assign the chat.
 
-There is still a runtime assumption to verify: the row wrapper's `inboxModel` must be the known row adapter, a compatible typed model, or MBQThreadListModel accepted by the known adapter initializer. The probe reports the encountered class if this path is unsupported.
-
-Folders and thread-key memberships are stored in this app's own NSUserDefaults under a separate key for this single-account prototype. It does not import or overwrite old tweak data. Removing a folder removes only its local assignments.
+The picker still covers loaded chats only. Permanent tabs, native long-press assignment, reordering and multiple accounts remain outside this prototype.
 
 ## Build
 
-On macOS with Xcode, run `make test` and `make all`. The workflow runs Foundation-based filter tests, compiles the iOS arm64 dylib with warnings as errors, checks architecture, verifies ad-hoc signing, and produces a checksum. Compilation and tests do not prove runtime integration, rendering or MSGPlusX compatibility.
+Run make test and make all on macOS/Xcode. CI tests compact filtering, compiles with warnings as errors, and verifies arm64 and signing. These checks do not validate Messenger runtime behavior.

@@ -7,7 +7,7 @@
 - (instancetype)initWithListModel:(id)model;
 @end
 
-// F1: one-account prototype. Filter model rows, never cell visibility or row heights.
+// F2: one-account prototype. Filter model rows, never cell visibility or row heights.
 static NSMutableArray<NSMutableDictionary *> *Folders;
 static NSString *Selected;
 static __weak UIViewController *Inbox;
@@ -17,6 +17,7 @@ static NSMutableDictionary *Status;
 static UIButton *Launcher;
 static BOOL InboxVisible;
 static BOOL Ready;
+static NSMutableSet<NSString *> *SwipeKeys;
 static NSMapTable *DecodedRows;
 static NSString * const StoreKey = @"MSGChatFolders.F1.singleAccount";
 
@@ -134,6 +135,7 @@ static void Refresh(void) {
 
 @interface MCFFoldersController : UITableViewController
 @property(nonatomic,copy) NSString *editingFolder;
+@property(nonatomic,copy) NSDictionary *assigningChat;
 @property(nonatomic,strong) NSArray<NSDictionary *> *availableChats;
 @end
 @interface MCFLauncher : NSObject
@@ -143,10 +145,12 @@ static void Refresh(void) {
 @implementation MCFFoldersController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title=self.editingFolder ? Folder(self.editingFolder)[@"name"] : @"Chat folders · F1";
+    self.title=self.assigningChat ? self.assigningChat[@"title"] : self.editingFolder ? Folder(self.editingFolder)[@"name"] : @"Chat folders · F2";
     self.tableView.backgroundColor=UIColor.systemGroupedBackgroundColor;
     self.availableChats=[Chats copy] ?: @[];
-    if (!self.editingFolder) {
+    if (self.editingFolder) {
+        self.navigationItem.rightBarButtonItem=[[UIBarButtonItem alloc] initWithTitle:@"Rename" style:UIBarButtonItemStylePlain target:self action:@selector(renameCurrent)];
+    } else {
         self.navigationItem.leftBarButtonItem=[[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
         self.navigationItem.rightBarButtonItems=@[
             [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(create)],
@@ -154,17 +158,22 @@ static void Refresh(void) {
     }
 }
 - (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section { return self.editingFolder ? self.availableChats.count : Folders.count+1; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)section { return self.editingFolder ? @"Tap chats to toggle membership" : @"Choose a folder · ⓘ to assign chats"; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section { return self.assigningChat ? Folders.count : self.editingFolder ? self.availableChats.count : Folders.count+1; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)section { return self.assigningChat ? @"Tap folders to toggle this chat · + to create" : self.editingFolder ? @"Tap chats to toggle membership" : @"Choose a folder · ⓘ to assign chats"; }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
+    if (self.assigningChat) return @"Changes save immediately. This chat can belong to more than one folder.";
     if (self.editingFolder) return @"Only conversations loaded by Messenger are shown. Scroll the All list to load older chats, then reopen this picker.";
     if (!Ready) return @"Waiting for supported conversation models. Use Share to export status if your chats are already visible.";
-    return @"Folders are stored on this installation for your single Messenger account. Swipe a folder to delete it.";
+    return @"Folders are stored on this installation for your single Messenger account. Swipe a folder to rename or delete it.";
 }
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *cell=[tv dequeueReusableCellWithIdentifier:@"row"] ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"row"];
     cell.accessoryType=UITableViewCellAccessoryNone; cell.detailTextLabel.text=nil;
-    if (self.editingFolder) {
+    if (self.assigningChat) {
+        NSDictionary *f=Folders[ip.row]; cell.textLabel.text=f[@"name"];
+        cell.imageView.image=[UIImage systemImageNamed:@"folder"];
+        if ([f[@"members"] containsObject:self.assigningChat[@"key"]]) cell.accessoryType=UITableViewCellAccessoryCheckmark;
+    } else if (self.editingFolder) {
         NSDictionary *chat=self.availableChats[ip.row];
         cell.textLabel.text=chat[@"title"];
         if ([Folder(self.editingFolder)[@"members"] containsObject:chat[@"key"]]) cell.accessoryType=UITableViewCellAccessoryCheckmark;
@@ -182,6 +191,11 @@ static void Refresh(void) {
 }
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
+    if (self.assigningChat) {
+        NSMutableArray *members=Folders[ip.row][@"members"]; NSString *key=self.assigningChat[@"key"];
+        if ([members containsObject:key]) [members removeObject:key]; else [members addObject:key];
+        Save(); [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone]; return;
+    }
     if (self.editingFolder) {
         NSMutableArray *members=Folder(self.editingFolder)[@"members"];
         NSString *key=self.availableChats[ip.row][@"key"];
@@ -193,16 +207,49 @@ static void Refresh(void) {
     [self close];
 }
 - (void)tableView:(UITableView *)tv accessoryButtonTappedForRowWithIndexPath:(NSIndexPath *)ip {
-    if (!Ready || ip.row==0) return;
+    if (self.assigningChat || !Ready || ip.row==0) return;
     MCFFoldersController *picker=[[MCFFoldersController alloc] initWithStyle:UITableViewStyleInsetGrouped];
     picker.editingFolder=Folders[ip.row-1][@"id"];
     [self.navigationController pushViewController:picker animated:YES];
 }
-- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return !self.editingFolder && ip.row>0; }
+- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return !self.assigningChat && !self.editingFolder && ip.row>0; }
 - (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {
     if (style!=UITableViewCellEditingStyleDelete) return;
     if ([Selected isEqual:Folders[ip.row-1][@"id"]]) Selected=nil;
     [Folders removeObjectAtIndex:ip.row-1]; Save(); [tv deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+- (void)renameCurrent { [self renameFolder:self.editingFolder]; }
+- (void)renameFolder:(NSString *)folderID {
+    NSMutableDictionary *folder=Folder(folderID); if (!folder) return;
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:@"Rename folder" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.text=folder[@"name"]; tf.autocapitalizationType=UITextAutocapitalizationTypeWords; }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf=self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
+        NSString *name=[alert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSMutableDictionary *current=Folder(folderID); if (!name.length || !current) return;
+        current[@"name"]=name; Save();
+        if ([weakSelf.editingFolder isEqual:folderID]) weakSelf.title=name;
+        [weakSelf.tableView reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
+    if (self.assigningChat || self.editingFolder || ip.row==0 || ip.row>=(NSInteger)Folders.count+1) return nil;
+    NSString *folderID=[Folders[ip.row-1][@"id"] copy];
+    __weak typeof(self) weakSelf=self;
+    UIContextualAction *rename=[UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Rename" handler:^(UIContextualAction *a,UIView *v,void (^done)(BOOL)){
+        done(YES); [weakSelf renameFolder:folderID];
+    }];
+    rename.backgroundColor=UIColor.systemIndigoColor;
+    UIContextualAction *remove=[UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Delete" handler:^(UIContextualAction *a,UIView *v,void (^done)(BOOL)){
+        NSMutableDictionary *folder=Folder(folderID);
+        if (folder) { if ([Selected isEqual:folderID]) Selected=nil; [Folders removeObjectIdenticalTo:folder]; Save(); }
+        done(YES); [weakSelf.tableView reloadData];
+    }];
+    UISwipeActionsConfiguration *config=[UISwipeActionsConfiguration configurationWithActions:@[remove,rename]];
+    config.performsFirstActionWithFullSwipe=NO;
+    return config;
 }
 - (void)create {
     UIAlertController *alert=[UIAlertController alertControllerWithTitle:@"New folder" message:nil preferredStyle:UIAlertControllerStyleAlert];
@@ -220,7 +267,7 @@ static void Refresh(void) {
 - (void)close { [self dismissViewControllerAnimated:YES completion:^{ Refresh(); Launcher.hidden=!InboxVisible; }]; }
 - (void)share {
     NSData *data=[NSJSONSerialization dataWithJSONObject:Status options:NSJSONWritingPrettyPrinted error:nil];
-    NSURL *url=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"MSGChatFolders-F1.json"]];
+    NSURL *url=[NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"MSGChatFolders-F2.json"]];
     if (![data writeToURL:url atomically:YES]) return;
     UIActivityViewController *share=[[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
     share.popoverPresentationController.barButtonItem=self.navigationItem.rightBarButtonItems.lastObject;
@@ -251,7 +298,7 @@ static void Attach(UIViewController *vc) {
     if (!window) return;
     if (!Launcher) {
         Launcher=[UIButton buttonWithType:UIButtonTypeSystem];
-        [Launcher setTitle:@"Folders · F1" forState:UIControlStateNormal];
+        [Launcher setTitle:@"Folders · F2" forState:UIControlStateNormal];
         [Launcher setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         Launcher.backgroundColor=UIColor.systemIndigoColor; Launcher.layer.cornerRadius=17;
         Launcher.titleLabel.font=[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
@@ -259,6 +306,61 @@ static void Attach(UIViewController *vc) {
     }
     [window addSubview:Launcher]; Launcher.hidden=NO;
     Launcher.frame=CGRectMake(MAX(8,window.bounds.size.width-126),window.safeAreaInsets.top+52,118,34);
+}
+
+// Capture only identities read while Messenger constructs this inbox swipe menu.
+// Never equate an index path with a position in the unfiltered source array.
+static void InstallSwipe(void) {
+    Class adapter=NSClassFromString(@"MSGInboxRowAdapter"), binder=NSClassFromString(@"MSGListBinder");
+    SEL keySEL=NSSelectorFromString(@"threadKey");
+    SEL swipeSEL=@selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:);
+    Method km=class_getInstanceMethod(adapter,keySEL), sm=class_getInstanceMethod(binder,swipeSEL);
+    if (!Signature(km,'q',"") || !Signature(sm,'@',"@@")) { Status[@"swipe_hook"]=@"Signature unavailable"; return; }
+    IMP oldKey=method_getImplementation(km), oldSwipe=method_getImplementation(sm);
+    IMP newKey=imp_implementationWithBlock(^long long(id receiver){
+        long long key=((long long(*)(id,SEL))oldKey)(receiver,keySEL);
+        if (NSThread.isMainThread && SwipeKeys && key) [SwipeKeys addObject:[NSString stringWithFormat:@"%lld",key]];
+        return key;
+    });
+    IMP newSwipe=imp_implementationWithBlock(^id(id receiver,UITableView *table,NSIndexPath *ip){
+        UIViewController *inbox=Inbox;
+        BOOL scoped=NSThread.isMainThread && InboxVisible && inbox &&
+            receiver==ObjectField(inbox,"_listBinder") && table.delegate==receiver &&
+            [table isDescendantOfView:inbox.view] && !SwipeKeys;
+        if (!scoped) return ((id(*)(id,SEL,id,id))oldSwipe)(receiver,swipeSEL,table,ip);
+        NSMutableSet *keys=[NSMutableSet set]; SwipeKeys=keys;
+        id original=nil;
+        @try { original=((id(*)(id,SEL,id,id))oldSwipe)(receiver,swipeSEL,table,ip); }
+        @finally { SwipeKeys=nil; }
+        Status[@"swipe_calls"]=@([Status[@"swipe_calls"] unsignedIntegerValue]+1);
+        Status[@"swipe_identity_count"]=@(keys.count);
+        if (keys.count!=1 || (original && ![original isKindOfClass:UISwipeActionsConfiguration.class])) return original;
+        NSDictionary *chat=nil;
+        for (NSDictionary *entry in Chats) if ([entry[@"key"] isEqual:keys.anyObject]) { chat=[entry copy]; break; }
+        if (!chat) { Status[@"swipe_identity_matched"]=@NO; return original; }
+        Status[@"swipe_identity_matched"]=@YES;
+        UIContextualAction *action=[UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Folder" handler:^(UIContextualAction *a,UIView *v,void (^done)(BOOL)){
+            done(YES);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *vc=Inbox;
+                if (!vc || !InboxVisible || vc.presentedViewController) return;
+                MCFFoldersController *picker=[[MCFFoldersController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+                picker.assigningChat=chat;
+                UINavigationController *nav=[[UINavigationController alloc] initWithRootViewController:picker];
+                nav.modalPresentationStyle=UIModalPresentationFullScreen; Launcher.hidden=YES;
+                [vc presentViewController:nav animated:YES completion:nil];
+            });
+        }];
+        action.image=[UIImage systemImageNamed:@"folder.badge.plus"]; action.backgroundColor=UIColor.systemIndigoColor;
+        NSMutableArray *actions=[NSMutableArray arrayWithArray:((UISwipeActionsConfiguration *)original).actions ?: @[]];
+        [actions addObject:action];
+        UISwipeActionsConfiguration *result=[UISwipeActionsConfiguration configurationWithActions:actions];
+        result.performsFirstActionWithFullSwipe=original ? ((UISwipeActionsConfiguration *)original).performsFirstActionWithFullSwipe : NO;
+        return result;
+    });
+    if (!class_addMethod(adapter,keySEL,newKey,method_getTypeEncoding(km))) method_setImplementation(km,newKey);
+    if (!class_addMethod(binder,swipeSEL,newSwipe,method_getTypeEncoding(sm))) method_setImplementation(sm,newSwipe);
+    Status[@"swipe_hook"]=@"installed";
 }
 
 static void Install(void) {
@@ -291,7 +393,7 @@ __attribute__((constructor)) static void Start(void) {
         if (![[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] isEqual:@"571.0.0"]) return;
         Load(); Chats=@[];
         DecodedRows=[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];
-        Status=[@{@"build":@"F1-20260914",@"privacy":@"Counts, class names and status only; no chat names or identifiers"} mutableCopy];
-        Install();
+        Status=[@{@"build":@"F2-20260915",@"privacy":@"Counts, class names and status only; no chat names or identifiers"} mutableCopy];
+        Install(); InstallSwipe();
     });
 }
